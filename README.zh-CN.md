@@ -50,6 +50,10 @@ if (!gateway.ok) {
 所有 public manager、client、codec、transport、domain type 和
 `NatErrorCode` 都从 package root 导出。
 
+只需要 transport-agnostic domain enum 与 type 的应用可以从
+`@motrix/nat/types` 导入。该子路径不引入 Node.js built-in module，可安全用于
+browser 或 renderer bundle。
+
 ## Logger 注入
 
 默认 logger 为 no-op。应用可注入 pino-compatible logger：

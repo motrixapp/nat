@@ -54,6 +54,10 @@ if (!gateway.ok) {
 All public managers, clients, codecs, transports, domain types, and
 `NatErrorCode` are exported from the package root.
 
+Applications that only need transport-agnostic domain enums and types can
+import them from `@motrix/nat/types`. This subpath has no Node.js built-in
+imports and is safe to include in browser or renderer bundles.
+
 ## Logger injection
 
 Logging is a no-op unless a pino-compatible logger is injected:
