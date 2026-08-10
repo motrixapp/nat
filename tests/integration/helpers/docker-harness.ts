@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createConnection } from 'node:net'
 import { setTimeout as wait } from 'node:timers/promises'
 
 const COMPOSE_CWD = 'tests/docker'
@@ -6,6 +7,12 @@ const COMPOSE_CWD = 'tests/docker'
 export async function composeUp(): Promise<void> {
   await run('docker', ['compose', 'up', '-d'])
   await waitForMatrixReady(30_000)
+  // A container can be "running" before its userspace server has bound its
+  // socket. The hostile router is the first bridge HTTP service exercised by
+  // the suite, so without an endpoint probe that test is vulnerable to a
+  // startup race on fast Linux runners.
+  await waitForServiceTcp('hostile', 49154, 10_000)
+  await waitForServiceTcp('broken', 49155, 10_000)
 }
 
 export async function composeDown(): Promise<void> {
@@ -50,6 +57,40 @@ async function waitForMatrixReady(timeoutMs: number): Promise<void> {
     }
     await wait(500)
   }
+}
+
+async function waitForServiceTcp(
+  service: string,
+  port: number,
+  timeoutMs: number
+): Promise<void> {
+  const host = await containerIp(service)
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() <= deadline) {
+    if (await canConnect(host, port)) return
+    await wait(100)
+  }
+  await dumpMatrixEvidence()
+  throw new Error(
+    `NAT matrix service ${service} not listening on ${host}:${port} ` +
+      `after ${timeoutMs}ms`
+  )
+}
+
+function canConnect(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host, port })
+    let settled = false
+    const finish = (ready: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(ready)
+    }
+    socket.setTimeout(500, () => finish(false))
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+  })
 }
 
 interface ComposePsRow {
