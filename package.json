@@ -1,0 +1,71 @@
+{
+  "name": "@motrix/nat",
+  "version": "0.1.0",
+  "description": "Dependency-free UPnP IGD, NAT-PMP, PCP, and STUN for Node.js",
+  "license": "MIT",
+  "author": "Motrix",
+  "homepage": "https://github.com/motrixapp/nat#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/motrixapp/nat.git"
+  },
+  "bugs": {
+    "url": "https://github.com/motrixapp/nat/issues"
+  },
+  "keywords": [
+    "nat",
+    "upnp",
+    "nat-pmp",
+    "pcp",
+    "stun",
+    "port-mapping",
+    "networking",
+    "motrix"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.13.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "NAT_DOCKER_MATRIX=1 vitest run tests/integration/nat-docker.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check . && node scripts/lint-nat-module.mjs",
+    "lint:nat": "node scripts/lint-nat-module.mjs",
+    "format": "biome format --write .",
+    "fuzz": "node --import tsx scripts/fuzz-nat-codecs.mjs --duration=30",
+    "fuzz:ci": "node --import tsx scripts/fuzz-nat-codecs.mjs --duration=300",
+    "prepublishOnly": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.7",
+    "@fast-check/vitest": "^0.4.1",
+    "@types/node": "^24.0.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.11",
+    "typescript": "~7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

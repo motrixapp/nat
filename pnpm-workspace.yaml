@@ -1,0 +1,4 @@
+# Single-package repository. esbuild is a build-time transitive dependency of
+# tsup and is not included in the published package.
+allowBuilds:
+  esbuild: true
