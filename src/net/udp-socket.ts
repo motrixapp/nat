@@ -16,6 +16,7 @@ export type UdpMessageListener = (msg: Buffer, rinfo: UdpRemoteInfo) => void
 export interface UdpSocket {
   bind(port?: number, address?: string): Promise<void>
   addMembership(multicastAddress: string, interfaceAddress?: string): void
+  setMulticastInterface?(interfaceAddress: string): void
   setMulticastTTL(ttl: number): void
   send(msg: Buffer, port: number, address: string): Promise<void>
   onMessage(listener: UdpMessageListener): void
@@ -57,6 +58,11 @@ export class NodeUdpSocket implements UdpSocket {
   addMembership(multicastAddress: string, interfaceAddress?: string): void {
     if (!this.socket) throw new Error('socket closed')
     this.socket.addMembership(multicastAddress, interfaceAddress)
+  }
+
+  setMulticastInterface(interfaceAddress: string): void {
+    if (!this.socket) throw new Error('socket closed')
+    this.socket.setMulticastInterface(interfaceAddress)
   }
 
   setMulticastTTL(ttl: number): void {

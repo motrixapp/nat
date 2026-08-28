@@ -10,6 +10,7 @@ import {
   SSDP_MULTICAST_PORT,
 } from '../codecs/index.js'
 import {
+  isIpv4String,
   isLinkLocalIpv4,
   isPrivateIpv4,
   isValidPort,
@@ -33,6 +34,8 @@ export interface DiscoverOptions {
   timeoutMs?: number
   maxResponses?: number
   mx?: number
+  /** Local IPv4 address used as the SSDP multicast source interface. */
+  interfaceAddress?: string
   /**
    * SSDP search targets to M-SEARCH for. Defaults to {@link
    * SSDP_IGD_SEARCH_TARGETS} (IGD v1 + v2); one packet is sent per target on
@@ -86,6 +89,13 @@ export class UpnpClient {
   async discover(
     options: DiscoverOptions = {}
   ): Promise<ParseResult<DiscoveredGateway>> {
+    const interfaceAddress = options.interfaceAddress
+    if (interfaceAddress && !isIpv4String(interfaceAddress)) {
+      return parseErr(
+        NatErrorCode.DiscoveryFailed,
+        'invalid SSDP interface address'
+      )
+    }
     if (this.discovering) {
       return parseErr(
         NatErrorCode.DiscoveryFailed,
@@ -202,7 +212,12 @@ export class UpnpClient {
 
       ;(async () => {
         try {
-          await socket.bind(0)
+          await socket.bind(0, interfaceAddress)
+          if (interfaceAddress) {
+            // Binding fixes the unicast response address; IP_MULTICAST_IF
+            // fixes the outgoing M-SEARCH interface (including on Windows).
+            socket.setMulticastInterface?.(interfaceAddress)
+          }
           for (const st of searchTargets) {
             await socket.send(
               buildMSearch(st, mx),

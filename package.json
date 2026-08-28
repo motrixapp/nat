@@ -1,6 +1,6 @@
 {
   "name": "@motrix/nat",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Dependency-free UPnP IGD, NAT-PMP, PCP, and STUN for Node.js",
   "license": "MIT",
   "author": "Motrix",
@@ -47,7 +47,7 @@
   "engines": {
     "node": ">=22"
   },
-  "packageManager": "pnpm@11.13.0",
+  "packageManager": "pnpm@11.24.0",
   "publishConfig": {
     "access": "public"
   },

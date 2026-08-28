@@ -35,6 +35,9 @@ describe('MockUdpSocket', () => {
     )
     await expect(s.bind()).rejects.toThrow('socket closed')
     expect(() => s.addMembership('239.255.255.250')).toThrow('socket closed')
+    expect(() => s.setMulticastInterface?.('192.168.1.10')).toThrow(
+      'socket closed'
+    )
     expect(() => s.setMulticastTTL(4)).toThrow('socket closed')
   })
 })

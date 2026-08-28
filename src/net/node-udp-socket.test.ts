@@ -17,6 +17,7 @@ class FakeSocket extends EventEmitter {
       callback()
   )
   addMembership = vi.fn()
+  setMulticastInterface = vi.fn()
   setMulticastTTL = vi.fn()
   send = vi.fn(
     (
@@ -78,6 +79,7 @@ describe('NodeUdpSocket', () => {
     const payload = Buffer.from('hello')
 
     subject.addMembership('239.255.255.250', '192.168.1.10')
+    subject.setMulticastInterface('192.168.1.10')
     subject.setMulticastTTL(4)
     await subject.send(payload, 1900, '239.255.255.250')
 
@@ -85,6 +87,7 @@ describe('NodeUdpSocket', () => {
       '239.255.255.250',
       '192.168.1.10'
     )
+    expect(socket.setMulticastInterface).toHaveBeenCalledWith('192.168.1.10')
     expect(socket.setMulticastTTL).toHaveBeenCalledWith(4)
     expect(socket.send).toHaveBeenCalledWith(
       payload,
@@ -152,6 +155,9 @@ describe('NodeUdpSocket', () => {
       subject.send(Buffer.from('x'), 1, '127.0.0.1')
     ).rejects.toThrow('socket closed')
     expect(() => subject.addMembership('239.0.0.1')).toThrow('socket closed')
+    expect(() => subject.setMulticastInterface('192.168.1.10')).toThrow(
+      'socket closed'
+    )
     expect(() => subject.setMulticastTTL(1)).toThrow('socket closed')
   })
 })

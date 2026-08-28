@@ -1,5 +1,5 @@
-import os from 'node:os'
 import { natLogger } from './logger.js'
+import { createCachedNetworkRouteResolver } from './network-route.js'
 
 const log = natLogger('network-monitor')
 
@@ -13,6 +13,7 @@ export interface NetworkMonitorOptions {
   intervalMs?: number
   stableRounds?: number // Consecutive identical snapshots before emitting a change
   snapshotFn?: () => NetworkSnapshot // Injectable for tests
+  verifiedSnapshotFn?: () => Promise<NetworkSnapshot>
 }
 
 export const DEFAULT_INTERVAL_MS = 5000
@@ -24,6 +25,7 @@ export class NetworkMonitor {
   private readonly intervalMs: number
   private readonly stableRounds: number
   private readonly snapshotFn: () => NetworkSnapshot
+  private readonly verifiedSnapshotFn: () => Promise<NetworkSnapshot>
   private timer: NodeJS.Timeout | null = null
   private listeners = new Set<NetworkChangeListener>()
   private established: NetworkSnapshot | null = null
@@ -33,7 +35,13 @@ export class NetworkMonitor {
   constructor(opts: NetworkMonitorOptions = {}) {
     this.intervalMs = Math.max(500, opts.intervalMs ?? DEFAULT_INTERVAL_MS)
     this.stableRounds = Math.max(1, opts.stableRounds ?? DEFAULT_STABLE_ROUNDS)
-    this.snapshotFn = opts.snapshotFn ?? defaultSnapshotFn
+    const defaultSource = createDefaultSnapshotSource()
+    this.snapshotFn = opts.snapshotFn ?? defaultSource.snapshot
+    this.verifiedSnapshotFn =
+      opts.verifiedSnapshotFn ??
+      (opts.snapshotFn
+        ? async () => this.snapshotFn()
+        : defaultSource.verifiedSnapshot)
   }
 
   onChange(listener: NetworkChangeListener): () => void {
@@ -61,6 +69,15 @@ export class NetworkMonitor {
     } catch (err) {
       log.warn({ err }, 'snapshot failed')
       return { gatewayIp: '', internalIp: '', hash: '' }
+    }
+  }
+
+  async verifiedSnapshot(): Promise<NetworkSnapshot> {
+    try {
+      return await this.verifiedSnapshotFn()
+    } catch (err) {
+      log.warn({ err }, 'verified snapshot failed; using current snapshot')
+      return this.snapshot()
     }
   }
 
@@ -102,32 +119,23 @@ export class NetworkMonitor {
   }
 }
 
-function defaultSnapshotFn(): NetworkSnapshot {
-  const ifaces = os.networkInterfaces()
-  let internalIp = ''
-  let gatewayIp = ''
-  // Best-effort: first IPv4 non-internal address. True default gateway
-  // detection requires platform-specific calls; Phase 1 uses the presence
-  // of interfaces as a proxy.
-  for (const iface of Object.values(ifaces)) {
-    if (!iface) continue
-    for (const addr of iface) {
-      if (addr.family === 'IPv4' && !addr.internal) {
-        internalIp = addr.address
-        // Derive probable gateway as .1 on the same /24 — heuristic;
-        // NatManager re-discovers
-        const parts = addr.address.split('.')
-        if (parts.length === 4) {
-          gatewayIp = `${parts[0]}.${parts[1]}.${parts[2]}.1`
-        }
-        break
-      }
+function createDefaultSnapshotSource(): {
+  snapshot: () => NetworkSnapshot
+  verifiedSnapshot: () => Promise<NetworkSnapshot>
+} {
+  const resolveRoute = createCachedNetworkRouteResolver()
+  const toSnapshot = (route: {
+    gatewayIp: string
+    internalIp: string
+  }): NetworkSnapshot => {
+    return {
+      gatewayIp: route.gatewayIp,
+      internalIp: route.internalIp,
+      hash: `${route.gatewayIp}|${route.internalIp}`,
     }
-    if (internalIp) break
   }
   return {
-    gatewayIp,
-    internalIp,
-    hash: `${gatewayIp}|${internalIp}`,
+    snapshot: () => toSnapshot(resolveRoute()),
+    verifiedSnapshot: async () => toSnapshot(await resolveRoute.verified()),
   }
 }

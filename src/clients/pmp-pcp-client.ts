@@ -2,6 +2,7 @@ import {
   buildExternalIpRequest,
   buildMappingRequest,
   buildPcpMapRequest,
+  ipv4ToBuffer,
   isIpv4String,
   NATPMP_OPCODE_EXTERNAL_IP,
   NATPMP_OPCODE_MAP_TCP,
@@ -37,6 +38,11 @@ export interface PmpPcpClientOptions {
   now?: () => number
 }
 
+export interface PmpPcpNetworkRoute {
+  gatewayIp: string
+  internalIp: string
+}
+
 interface PendingNonce {
   nonce: Buffer
   expiresAt: number
@@ -65,7 +71,7 @@ export class PmpPcpClient {
   private socketReady: Promise<void> | null = null
   private readonly udpFactory: UdpSocketFactory
   private gatewayIp: string
-  private readonly clientIp: Buffer
+  private clientIp: Buffer
   private readonly now: () => number
 
   private readonly pendingNonces = new Map<string, PendingNonce>()
@@ -75,16 +81,16 @@ export class PmpPcpClient {
   constructor(opts: PmpPcpClientOptions) {
     this.udpFactory = opts.udpFactory
     this.gatewayIp = opts.gatewayIp
-    this.clientIp = opts.clientIp
+    this.clientIp = Buffer.from(opts.clientIp)
     this.now = opts.now ?? (() => Date.now())
   }
 
   /**
    * Point subsequent NAT-PMP / PCP traffic at a different gateway address.
    *
-   * Used by NatManager when discovery reveals a gateway that differs from the
-   * one supplied at construction (common: constructor gets a
-   * NetworkMonitor-snapshot best-effort; discovery learns the real one).
+   * Prefer setNetworkRoute() after an interface change so PCP's embedded
+   * client address changes with the gateway. This method remains for callers
+   * that intentionally need a gateway-only update.
    *
    * Any requests already in flight retain the address they were sent to —
    * responses from the old gateway arriving after the switch will be dropped
@@ -101,6 +107,36 @@ export class PmpPcpClient {
       )
     }
     this.gatewayIp = ip
+  }
+
+  /** Atomically update the gateway and PCP client address after a route change. */
+  setNetworkRoute(route: PmpPcpNetworkRoute): void {
+    if (
+      !route.gatewayIp ||
+      route.gatewayIp === '0.0.0.0' ||
+      !isIpv4String(route.gatewayIp)
+    ) {
+      throw new RangeError(
+        `PmpPcpClient.setNetworkRoute: invalid gateway IPv4 address: ${JSON.stringify(route.gatewayIp)}`
+      )
+    }
+    if (
+      !route.internalIp ||
+      route.internalIp === '0.0.0.0' ||
+      !isIpv4String(route.internalIp)
+    ) {
+      throw new RangeError(
+        `PmpPcpClient.setNetworkRoute: invalid internal IPv4 address: ${JSON.stringify(route.internalIp)}`
+      )
+    }
+
+    const clientIp = Buffer.concat([
+      Buffer.alloc(10),
+      Buffer.from([0xff, 0xff]),
+      ipv4ToBuffer(route.internalIp),
+    ])
+    this.gatewayIp = route.gatewayIp
+    this.clientIp = clientIp
   }
 
   async natPmpGetExternalIp(
