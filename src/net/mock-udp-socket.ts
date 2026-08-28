@@ -19,6 +19,7 @@ export class MockUdpSocket implements UdpSocket {
   public boundPort: number | null = null
   public boundAddress: string | null = null
   public memberships: Array<{ multicast: string; iface?: string }> = []
+  public multicastInterface: string | null = null
   public ttl: number | null = null
   public closed = false
 
@@ -33,6 +34,11 @@ export class MockUdpSocket implements UdpSocket {
   addMembership(multicast: string, iface?: string): void {
     if (this.closed) throw new Error('socket closed')
     this.memberships.push(iface ? { multicast, iface } : { multicast })
+  }
+
+  setMulticastInterface(interfaceAddress: string): void {
+    if (this.closed) throw new Error('socket closed')
+    this.multicastInterface = interfaceAddress
   }
 
   setMulticastTTL(ttl: number): void {

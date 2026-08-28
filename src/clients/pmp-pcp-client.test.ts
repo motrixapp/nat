@@ -172,4 +172,53 @@ describe('PmpPcpClient', () => {
       expect(() => client.setGatewayIp('10.0.0.256')).toThrow(RangeError)
     })
   })
+
+  describe('setNetworkRoute', () => {
+    it('updates both the datagram destination and PCP client address', async () => {
+      client.setNetworkRoute({
+        gatewayIp: '10.0.0.1',
+        internalIp: '10.0.0.42',
+      })
+      const pending = client.pcpMap({
+        internalPort: 6881,
+        externalPort: 6881,
+        protocol: 'TCP',
+        ttl: 7200,
+        timeoutMs: 500,
+      })
+      await tick()
+
+      const sent = udpFactory.sockets[0]?.sendCalls[0]
+      expect(sent?.address).toBe('10.0.0.1')
+      expect(sent?.data.subarray(8, 24)).toEqual(
+        Buffer.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 42])
+      )
+
+      await client.close()
+      await pending
+    })
+
+    it('rejects invalid routes atomically', async () => {
+      expect(() =>
+        client.setNetworkRoute({
+          gatewayIp: '10.0.0.1',
+          internalIp: '',
+        })
+      ).toThrow(RangeError)
+
+      const pending = client.pcpMap({
+        internalPort: 6881,
+        externalPort: 6881,
+        protocol: 'TCP',
+        ttl: 7200,
+        timeoutMs: 500,
+      })
+      await tick()
+      const sent = udpFactory.sockets[0]?.sendCalls[0]
+      expect(sent?.address).toBe(gatewayIp)
+      expect(sent?.data.subarray(8, 24)).toEqual(clientIp)
+      await client.close()
+      await pending
+    })
+  })
 })

@@ -191,8 +191,8 @@ function valueOrThrow<T>(result: ParseResult<T>): T {
 
 This keeps expected network, validation, and protocol failures out of
 exception control flow. Constructor misuse and invalid imperative updates may
-still throw; for example, `PmpPcpClient.setGatewayIp()` throws `RangeError` for
-an invalid IPv4 address.
+still throw; for example, `PmpPcpClient.setNetworkRoute()` throws `RangeError`
+for an invalid gateway or internal IPv4 address.
 
 `NatErrorCode` contains the stable package-level error codes:
 
@@ -389,12 +389,16 @@ The same client exposes:
 - `natPmpGetExternalIp({ timeoutMs, signal }?)`
 - `natPmpMap({ protocol, internalPort, externalPort, ttl, timeoutMs, signal })`
 - `pcpMap({ protocol, internalPort, externalPort, ttl, timeoutMs, signal, nonce })`
+- `setNetworkRoute({ gatewayIp, internalIp })`
 - `setGatewayIp(ip)`
 - `close()`
 
 NAT-PMP requests are serialized because the protocol has no transaction
 correlator. PCP requests are correlated by nonce and allow up to four
-concurrent requests per client.
+concurrent requests per client. After a network change, call
+`setNetworkRoute()` before the next probe or mapping so the gateway and PCP
+client address change atomically. `setGatewayIp()` remains available for
+gateway-only compatibility updates.
 
 ### STUN endpoint discovery
 

@@ -86,6 +86,34 @@ describe('UpnpClient.discover', () => {
     await discoverP
   })
 
+  it('binds SSDP discovery to the selected network interface', async () => {
+    const discoverP = client.discover({
+      timeoutMs: 100,
+      interfaceAddress: '10.0.0.42',
+    })
+    await tick()
+
+    const sock = udpFactory.sockets[0]!
+    expect(sock.boundAddress).toBe('10.0.0.42')
+    expect(sock.multicastInterface).toBe('10.0.0.42')
+    expect(sock.sendCalls).toHaveLength(2)
+    await discoverP
+  })
+
+  it('rejects an invalid SSDP interface before opening a socket', async () => {
+    const result = await client.discover({
+      timeoutMs: 100,
+      interfaceAddress: 'not-an-ip',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: NatErrorCode.DiscoveryFailed,
+      detail: 'invalid SSDP interface address',
+    })
+    expect(udpFactory.sockets).toHaveLength(0)
+  })
+
   it('searches for both IGD v1 and v2 targets', async () => {
     const discoverP = client.discover({ timeoutMs: 100 })
     await tick()

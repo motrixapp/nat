@@ -176,8 +176,9 @@ function valueOrThrow<T>(result: ParseResult<T>): T {
 ```
 
 因此，预期内的网络错误、校验失败和协议错误无需通过异常控制流程处理。构造参数
-误用或命令式更新中的无效值仍可能抛出异常；例如，传入无效 IPv4 地址时，
-`PmpPcpClient.setGatewayIp()` 会抛出 `RangeError`。
+误用或命令式更新中的无效值仍可能抛出异常；例如，向
+`PmpPcpClient.setNetworkRoute()` 传入无效的网关或内网 IPv4 地址时会抛出
+`RangeError`。
 
 `NatErrorCode` 定义了稳定的包级错误码：
 
@@ -370,11 +371,14 @@ try {
 - `natPmpGetExternalIp({ timeoutMs, signal }?)`
 - `natPmpMap({ protocol, internalPort, externalPort, ttl, timeoutMs, signal })`
 - `pcpMap({ protocol, internalPort, externalPort, ttl, timeoutMs, signal, nonce })`
+- `setNetworkRoute({ gatewayIp, internalIp })`
 - `setGatewayIp(ip)`
 - `close()`
 
 NAT-PMP 没有用于关联请求与响应的事务 ID，因此请求会串行执行。PCP 使用
-`nonce` 关联请求；每个客户端最多同时处理四个 PCP 请求。
+`nonce` 关联请求；每个客户端最多同时处理四个 PCP 请求。网络变化后，应在
+下次探测或映射前调用 `setNetworkRoute()`，以便原子更新网关和 PCP 客户端
+地址。`setGatewayIp()` 仍保留用于仅更新网关的兼容场景。
 
 ### STUN 公网端点发现
 

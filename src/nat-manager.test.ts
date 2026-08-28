@@ -85,6 +85,7 @@ function makeDeps(): TestDeps {
     natPmpMap: vi.fn(),
     pcpMap: vi.fn(),
     setGatewayIp: vi.fn(),
+    setNetworkRoute: vi.fn(),
     close: vi.fn(),
   }
   const networkMonitor = {
@@ -112,6 +113,20 @@ function makeDeps(): TestDeps {
     networkMonitor,
     settingsProvider,
   } as unknown as TestDeps
+}
+
+class RenewalTrackingNatManager extends NatManager {
+  renewalSchedules = 0
+  renewalClears = 0
+
+  protected override scheduleRenewal(): void {
+    this.renewalSchedules++
+  }
+
+  protected override clearRenewalTimer(): void {
+    this.renewalClears++
+    super.clearRenewalTimer()
+  }
 }
 
 describe('NatManager lifecycle', () => {
@@ -277,6 +292,68 @@ describe('NatManager discovery', () => {
     expect(manager.getStatus().gatewayInfo?.gatewayIp).toBe('192.168.1.1')
   })
 
+  it('binds UPnP discovery to the monitored default-route interface', async () => {
+    vi.mocked(deps.upnpClient.discover).mockResolvedValue(UPNP_GATEWAY_STUB)
+
+    await manager.start()
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledWith({
+      timeoutMs: 3000,
+      interfaceAddress: '192.168.1.100',
+    })
+    expect(deps.networkMonitor.snapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('awaits a verified route before accepting UPnP on a multi-NIC host', async () => {
+    const verified = Promise.withResolvers<{
+      gatewayIp: string
+      internalIp: string
+      hash: string
+    }>()
+    deps.networkMonitor.verifiedSnapshot = vi.fn(() => verified.promise)
+    vi.mocked(deps.networkMonitor.snapshot).mockReturnValue({
+      gatewayIp: '192.168.1.1',
+      internalIp: '192.168.1.20',
+      hash: 'fallback-a',
+    })
+    vi.mocked(deps.upnpClient.discover).mockResolvedValue({
+      ...UPNP_GATEWAY_STUB,
+      value: {
+        ...UPNP_GATEWAY_STUB.value,
+        gatewayIp: '10.0.0.254',
+        controlHost: '10.0.0.254',
+      },
+    })
+
+    const starting = manager.start()
+    await tick()
+    expect(deps.upnpClient.discover).not.toHaveBeenCalled()
+
+    verified.resolve({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.42',
+      hash: 'verified-b',
+    })
+    await starting
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(1)
+    expect(deps.upnpClient.discover).toHaveBeenCalledWith({
+      timeoutMs: 3000,
+      interfaceAddress: '10.0.0.42',
+    })
+    expect(deps.networkMonitor.snapshot).not.toHaveBeenCalled()
+
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockResolvedValue({ ok: false })
+    vi.mocked(deps.pmpPcpClient.natPmpMap).mockResolvedValue({ ok: false })
+    vi.mocked(deps.upnpClient.mapPort).mockResolvedValue({ ok: true })
+    await manager.mapConfiguredPorts()
+
+    expect(deps.upnpClient.mapPort).toHaveBeenCalledTimes(2)
+    for (const [, params] of vi.mocked(deps.upnpClient.mapPort).mock.calls) {
+      expect(params).toMatchObject({ internalIp: '10.0.0.42' })
+    }
+  })
+
   it('transitions Discovering → Failed when all protocols fail', async () => {
     vi.mocked(deps.upnpClient.discover).mockResolvedValue({
       ok: false,
@@ -295,6 +372,129 @@ describe('NatManager discovery', () => {
       )
       .map((e) => e.state)
     expect(states[states.length - 1]).toBe(NatState.Failed)
+  })
+
+  it('uses a background-refreshed route before probing NAT-PMP', async () => {
+    vi.mocked(deps.networkMonitor.snapshot)
+      .mockReturnValueOnce({
+        gatewayIp: '192.168.1.1',
+        internalIp: '192.168.1.100',
+        hash: 'fallback',
+      })
+      .mockReturnValueOnce({
+        gatewayIp: '192.168.1.254',
+        internalIp: '192.168.1.100',
+        hash: 'resolved',
+      })
+    vi.mocked(deps.upnpClient.discover).mockResolvedValue({ ok: false })
+    vi.mocked(deps.pmpPcpClient.natPmpGetExternalIp).mockResolvedValue({
+      ok: true,
+      value: { externalIp: '203.0.113.10' },
+    })
+
+    await manager.start()
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledWith({
+      timeoutMs: 3000,
+      interfaceAddress: '192.168.1.100',
+    })
+    expect(deps.pmpPcpClient.setNetworkRoute).toHaveBeenCalledWith({
+      gatewayIp: '192.168.1.254',
+      internalIp: '192.168.1.100',
+    })
+    const setNetworkRoute = deps.pmpPcpClient.setNetworkRoute
+    if (!setNetworkRoute) throw new Error('setNetworkRoute mock missing')
+    const gatewayUpdateOrder =
+      vi.mocked(setNetworkRoute).mock.invocationCallOrder[0]
+    const probeOrder = vi.mocked(deps.pmpPcpClient.natPmpGetExternalIp).mock
+      .invocationCallOrder[0]
+    expect(gatewayUpdateOrder).toBeLessThan(probeOrder ?? 0)
+  })
+
+  it('re-verifies the route after UPnP when topology changes mid-discovery', async () => {
+    const upnpResult = Promise.withResolvers<{ ok: false }>()
+    const routeB = Promise.withResolvers<{
+      gatewayIp: string
+      internalIp: string
+      hash: string
+    }>()
+    deps.networkMonitor.verifiedSnapshot = vi
+      .fn()
+      .mockResolvedValueOnce({
+        gatewayIp: '192.168.1.1',
+        internalIp: '192.168.1.20',
+        hash: 'route-a',
+      })
+      .mockReturnValueOnce(routeB.promise)
+    vi.mocked(deps.upnpClient.discover).mockReturnValue(upnpResult.promise)
+    vi.mocked(deps.pmpPcpClient.natPmpGetExternalIp).mockResolvedValue({
+      ok: true,
+      value: { externalIp: '203.0.113.10' },
+    })
+
+    const starting = manager.start()
+    await tick()
+    expect(deps.upnpClient.discover).toHaveBeenCalledWith({
+      timeoutMs: 3000,
+      interfaceAddress: '192.168.1.20',
+    })
+
+    upnpResult.resolve({ ok: false })
+    await tick()
+    expect(deps.networkMonitor.verifiedSnapshot).toHaveBeenCalledTimes(2)
+    expect(deps.pmpPcpClient.setNetworkRoute).not.toHaveBeenCalled()
+    expect(deps.pmpPcpClient.natPmpGetExternalIp).not.toHaveBeenCalled()
+
+    routeB.resolve({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.42',
+      hash: 'route-b',
+    })
+    await starting
+
+    expect(deps.pmpPcpClient.setNetworkRoute).toHaveBeenCalledTimes(1)
+    expect(deps.pmpPcpClient.setNetworkRoute).toHaveBeenCalledWith({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.42',
+    })
+    expect(deps.pmpPcpClient.natPmpGetExternalIp).toHaveBeenCalledTimes(1)
+    expect(manager.getStatus().gatewayInfo).toMatchObject({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.42',
+    })
+  })
+
+  it('does not probe an old NAT-PMP gateway when the route is unavailable', async () => {
+    vi.mocked(deps.networkMonitor.snapshot).mockReturnValue({
+      gatewayIp: '',
+      internalIp: '',
+      hash: '',
+    })
+    vi.mocked(deps.upnpClient.discover).mockResolvedValue({ ok: false })
+
+    await manager.start()
+
+    expect(deps.pmpPcpClient.setNetworkRoute).not.toHaveBeenCalled()
+    expect(deps.pmpPcpClient.natPmpGetExternalIp).not.toHaveBeenCalled()
+    expect(manager.getStatus().state).toBe(NatState.Failed)
+  })
+
+  it('keeps NAT-PMP available for a gateway-only legacy adapter', async () => {
+    delete deps.pmpPcpClient.setNetworkRoute
+    vi.mocked(deps.upnpClient.discover).mockResolvedValue({ ok: false })
+    vi.mocked(deps.pmpPcpClient.natPmpGetExternalIp).mockResolvedValue({
+      ok: true,
+      value: { externalIp: '203.0.113.10' },
+    })
+
+    await manager.start()
+
+    expect(deps.pmpPcpClient.setGatewayIp).toHaveBeenCalledWith('192.168.1.1')
+    expect(deps.pmpPcpClient.natPmpGetExternalIp).toHaveBeenCalledTimes(1)
+    expect(manager.getStatus().state).toBe(NatState.Ready)
+    expect(manager.getStatus().gatewayInfo?.supportedProtocols).toEqual([
+      NatProtocol.NatPmp,
+    ])
   })
 
   it('emits NatGatewayChanged when gateway is discovered', async () => {
@@ -349,6 +549,40 @@ describe('NatManager mapping with fallback', () => {
     expect(deps.upnpClient.mapPort).toHaveBeenCalled()
     expect(manager.getStatus().state).toBe(NatState.Active)
     expect(manager.getStatus().activeMappings).toHaveLength(2)
+  })
+
+  it('disables PCP but maps with NAT-PMP for a legacy adapter', async () => {
+    delete deps.pmpPcpClient.setNetworkRoute
+    vi.mocked(deps.pmpPcpClient.natPmpMap).mockResolvedValue({
+      ok: true,
+      value: { externalPort: 6881, ttl: 7200 },
+    })
+
+    await manager.start()
+    await manager.mapConfiguredPorts()
+
+    expect(deps.pmpPcpClient.setGatewayIp).toHaveBeenCalledWith('192.168.1.1')
+    expect(deps.pmpPcpClient.pcpMap).not.toHaveBeenCalled()
+    expect(deps.pmpPcpClient.natPmpMap).toHaveBeenCalledTimes(2)
+    expect(manager.getStatus().state).toBe(NatState.Active)
+  })
+
+  it('uses the discovery interface for UPnP mapping', async () => {
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockResolvedValue({ ok: false })
+    vi.mocked(deps.pmpPcpClient.natPmpMap).mockResolvedValue({ ok: false })
+    vi.mocked(deps.upnpClient.mapPort).mockResolvedValue({ ok: true })
+
+    await manager.start()
+    vi.mocked(deps.networkMonitor.snapshot).mockReturnValue({
+      gatewayIp: '10.0.0.1',
+      internalIp: '10.0.0.50',
+      hash: 'changed',
+    })
+    await manager.mapConfiguredPorts()
+
+    const mappingParams = vi.mocked(deps.upnpClient.mapPort).mock.calls[0]?.[1]
+    expect(mappingParams).toMatchObject({ internalIp: '192.168.1.100' })
+    expect(deps.networkMonitor.snapshot).toHaveBeenCalledTimes(1)
   })
 
   it('passes the lifecycle abort signal to UPnP mapPort and aborts it on stop', async () => {
@@ -648,6 +882,372 @@ describe('NatManager stop during in-flight discovery', () => {
   })
 })
 
+describe('NatManager stop during queued transitions', () => {
+  let deps: TestDeps
+  let manager: RenewalTrackingNatManager
+
+  beforeEach(() => {
+    deps = makeDeps()
+    vi.mocked(deps.upnpClient.discover).mockResolvedValue(UPNP_GATEWAY_STUB)
+    manager = new RenewalTrackingNatManager(deps)
+  })
+
+  it('drops queued discovery and invalidates an active mapping, then restarts', async () => {
+    const gate = Promise.withResolvers<void>()
+    let positiveMapCalls = 0
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockImplementation(async (params) => {
+      const ttl = (params as { ttl: number }).ttl
+      if (ttl === 0) return { ok: true }
+      positiveMapCalls++
+      if (positiveMapCalls === 1) await gate.promise
+      return { ok: true, value: { externalPort: 6881, ttl: 7200 } }
+    })
+
+    await manager.start()
+    const mapping = manager.mapConfiguredPorts()
+    await tick()
+    expect(manager.getStatus().state).toBe(NatState.Mapping)
+
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'changed' })
+    await tick()
+
+    await manager.stop()
+    expect(manager.getStatus().state).toBe(NatState.Stopped)
+    gate.resolve()
+    await mapping
+
+    expect(positiveMapCalls).toBe(1)
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(1)
+    expect(manager.getStatus().state).toBe(NatState.Stopped)
+    expect(manager.getStatus().activeMappings).toHaveLength(0)
+    expect(manager.renewalSchedules).toBe(0)
+
+    const cleanupIndex = vi
+      .mocked(deps.pmpPcpClient.pcpMap)
+      .mock.calls.findIndex(([params]) => (params as { ttl: number }).ttl === 0)
+    expect(cleanupIndex).toBeGreaterThanOrEqual(0)
+    const cleanupOrder = vi.mocked(deps.pmpPcpClient.pcpMap).mock
+      .invocationCallOrder[cleanupIndex]
+    const closeOrders = vi.mocked(deps.pmpPcpClient.close).mock
+      .invocationCallOrder
+    expect(closeOrders.at(-1)).toBeGreaterThan(cleanupOrder ?? 0)
+
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockResolvedValue({
+      ok: true,
+      value: { externalPort: 6881, ttl: 7200 },
+    })
+    await manager.start()
+    await manager.mapConfiguredPorts()
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(2)
+    expect(manager.getStatus().state).toBe(NatState.Active)
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
+    expect(manager.renewalSchedules).toBe(1)
+  })
+
+  it('invalidates an active remap and does not run queued discovery', async () => {
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockResolvedValue({
+      ok: true,
+      value: { externalPort: 6881, ttl: 7200 },
+    })
+    await manager.start()
+    await manager.mapConfiguredPorts()
+    manager.renewalSchedules = 0
+
+    const gate = Promise.withResolvers<void>()
+    let positiveRemapCalls = 0
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockImplementation(async (params) => {
+      const ttl = (params as { ttl: number }).ttl
+      if (ttl === 0) return { ok: true }
+      positiveRemapCalls++
+      if (positiveRemapCalls === 1) await gate.promise
+      return { ok: true, value: { externalPort: 6881, ttl: 7200 } }
+    })
+
+    const remapping = manager.remapAll()
+    await tick()
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'changed' })
+    await tick()
+
+    await manager.stop()
+    gate.resolve()
+    await remapping
+
+    expect(positiveRemapCalls).toBe(1)
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(1)
+    expect(manager.getStatus().state).toBe(NatState.Stopped)
+    expect(manager.getStatus().activeMappings).toHaveLength(0)
+    expect(manager.renewalSchedules).toBe(0)
+
+    const pcpCalls = vi.mocked(deps.pmpPcpClient.pcpMap).mock.calls
+    const lastCleanupIndex = pcpCalls.findLastIndex(
+      ([params]) => (params as { ttl: number }).ttl === 0
+    )
+    const lastCleanupOrder = vi.mocked(deps.pmpPcpClient.pcpMap).mock
+      .invocationCallOrder[lastCleanupIndex]
+    const lastCloseOrder = vi
+      .mocked(deps.pmpPcpClient.close)
+      .mock.invocationCallOrder.at(-1)
+    expect(lastCloseOrder).toBeGreaterThan(lastCleanupOrder ?? 0)
+  })
+
+  it('serializes a rapid stop then start without overwriting the new route', async () => {
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockResolvedValue({ ok: false })
+    vi.mocked(deps.pmpPcpClient.natPmpMap).mockResolvedValue({ ok: false })
+    vi.mocked(deps.upnpClient.mapPort).mockResolvedValue({ ok: true })
+    vi.mocked(deps.upnpClient.discover)
+      .mockReset()
+      .mockResolvedValueOnce(UPNP_GATEWAY_STUB)
+      .mockResolvedValueOnce({
+        ...UPNP_GATEWAY_STUB,
+        value: {
+          ...UPNP_GATEWAY_STUB.value,
+          gatewayIp: '10.0.0.254',
+          controlHost: '10.0.0.254',
+        },
+      })
+    await manager.start()
+    await manager.mapConfiguredPorts()
+
+    const unmapGate = Promise.withResolvers<void>()
+    let unmapCalls = 0
+    vi.mocked(deps.upnpClient.unmapPort).mockImplementation(async () => {
+      unmapCalls++
+      if (unmapCalls === 1) await unmapGate.promise
+      return { ok: true }
+    })
+    vi.mocked(deps.networkMonitor.snapshot).mockReturnValue({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.50',
+      hash: 'route-b',
+    })
+
+    const stopping = manager.stop()
+    const restarting = manager.start()
+    await tick()
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(1)
+
+    unmapGate.resolve()
+    await Promise.all([stopping, restarting])
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(2)
+    expect(manager.getStatus().state).toBe(NatState.Ready)
+    expect(manager.getStatus().gatewayInfo).toMatchObject({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.50',
+    })
+    for (const [gateway] of vi.mocked(deps.upnpClient.unmapPort).mock.calls) {
+      expect(gateway).toMatchObject({ gatewayIp: '192.168.1.1' })
+    }
+    const closeOrder = vi
+      .mocked(deps.pmpPcpClient.close)
+      .mock.invocationCallOrder.at(-1)
+    const secondDiscoveryOrder = vi.mocked(deps.upnpClient.discover).mock
+      .invocationCallOrder[1]
+    expect(secondDiscoveryOrder).toBeGreaterThan(closeOrder ?? 0)
+  })
+})
+
+describe('NatManager topology-change remapping', () => {
+  let deps: TestDeps
+  let manager: RenewalTrackingNatManager
+
+  const gatewayB = {
+    ...UPNP_GATEWAY_STUB,
+    value: {
+      ...UPNP_GATEWAY_STUB.value,
+      gatewayIp: '10.0.0.254',
+      controlHost: '10.0.0.254',
+    },
+  }
+
+  beforeEach(() => {
+    deps = makeDeps()
+    vi.mocked(deps.upnpClient.discover)
+      .mockResolvedValueOnce(UPNP_GATEWAY_STUB)
+      .mockResolvedValueOnce(gatewayB)
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockResolvedValue({
+      ok: true,
+      value: { externalPort: 6881, ttl: 7200 },
+    })
+    manager = new RenewalTrackingNatManager(deps)
+  })
+
+  it('clears route A and immediately rebuilds mappings on route B', async () => {
+    await manager.start()
+    await manager.mapConfiguredPorts()
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
+    expect(manager.renewalSchedules).toBe(1)
+
+    vi.mocked(deps.networkMonitor.snapshot).mockReturnValue({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.50',
+      hash: 'route-b',
+    })
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'route-b' })
+
+    expect(manager.getStatus().activeMappings).toHaveLength(0)
+    expect(manager.getStatus().gatewayInfo).toBeNull()
+    expect(manager.renewalClears).toBe(1)
+    await tick()
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(2)
+    expect(manager.getStatus().state).toBe(NatState.Active)
+    expect(manager.getStatus().gatewayInfo).toMatchObject({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.50',
+    })
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
+    expect(manager.renewalSchedules).toBe(2)
+    const mappingSizes = deps.events
+      .filter(
+        (event): event is Extract<NatEvent, { type: 'mapping-updated' }> =>
+          event.type === 'mapping-updated'
+      )
+      .map((event) => event.mappings.length)
+    expect(mappingSizes).toEqual([2, 0, 2])
+  })
+
+  it('does not retain route A when route B remapping fails', async () => {
+    await manager.start()
+    await manager.mapConfiguredPorts()
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
+
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockResolvedValue({ ok: false })
+    vi.mocked(deps.pmpPcpClient.natPmpMap).mockResolvedValue({ ok: false })
+    vi.mocked(deps.upnpClient.mapPort).mockResolvedValue({ ok: false })
+    vi.mocked(deps.networkMonitor.snapshot).mockReturnValue({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.50',
+      hash: 'route-b',
+    })
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'route-b' })
+    await tick()
+
+    expect(manager.getStatus().state).toBe(NatState.Failed)
+    expect(manager.getStatus().activeMappings).toHaveLength(0)
+    expect(manager.getStatus().gatewayInfo).toBeNull()
+    expect(manager.renewalSchedules).toBe(1)
+    expect(manager.renewalClears).toBeGreaterThanOrEqual(2)
+    const mappingSizes = deps.events
+      .filter(
+        (event): event is Extract<NatEvent, { type: 'mapping-updated' }> =>
+          event.type === 'mapping-updated'
+      )
+      .map((event) => event.mappings.length)
+    expect(mappingSizes).toEqual([2, 0])
+  })
+
+  it('consumes map and remap intents queued while B discovery awaits', async () => {
+    await manager.start()
+    await manager.mapConfiguredPorts()
+
+    const bDiscovery = Promise.withResolvers<typeof gatewayB>()
+    vi.mocked(deps.upnpClient.discover)
+      .mockReset()
+      .mockReturnValueOnce(bDiscovery.promise)
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockClear()
+    vi.mocked(deps.networkMonitor.snapshot).mockReturnValue({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.50',
+      hash: 'route-b',
+    })
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'route-b' })
+    await tick()
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(1)
+
+    deps.hooks._fireReady()
+    const remapping = manager.remapAll()
+    bDiscovery.resolve(gatewayB)
+    await remapping
+
+    expect(manager.getStatus().state).toBe(NatState.Active)
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
+    expect(deps.pmpPcpClient.pcpMap).toHaveBeenCalledTimes(2)
+    expect(manager.renewalSchedules).toBe(2)
+  })
+
+  it('consumes map and remap intents queued while B mapping awaits', async () => {
+    await manager.start()
+    await manager.mapConfiguredPorts()
+
+    const firstBMap = Promise.withResolvers<void>()
+    let bMapCalls = 0
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockClear()
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockImplementation(async () => {
+      bMapCalls++
+      if (bMapCalls === 1) await firstBMap.promise
+      return { ok: true, value: { externalPort: 6881, ttl: 7200 } }
+    })
+    vi.mocked(deps.networkMonitor.snapshot).mockReturnValue({
+      gatewayIp: '10.0.0.254',
+      internalIp: '10.0.0.50',
+      hash: 'route-b',
+    })
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'route-b' })
+    await tick()
+    expect(bMapCalls).toBe(1)
+
+    deps.hooks._fireReady()
+    const remapping = manager.remapAll()
+    firstBMap.resolve()
+    await remapping
+
+    expect(manager.getStatus().state).toBe(NatState.Active)
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
+    expect(bMapCalls).toBe(2)
+    expect(manager.renewalSchedules).toBe(2)
+  })
+
+  it('preserves remap intent when topology change clears a queued map', async () => {
+    const firstDiscovery = Promise.withResolvers<typeof UPNP_GATEWAY_STUB>()
+    vi.mocked(deps.upnpClient.discover)
+      .mockReset()
+      .mockReturnValueOnce(firstDiscovery.promise)
+      .mockResolvedValueOnce(gatewayB)
+    vi.mocked(deps.networkMonitor.snapshot)
+      .mockReturnValueOnce({
+        gatewayIp: '192.168.1.1',
+        internalIp: '192.168.1.100',
+        hash: 'route-a',
+      })
+      .mockReturnValue({
+        gatewayIp: '10.0.0.254',
+        internalIp: '10.0.0.50',
+        hash: 'route-b',
+      })
+
+    const starting = manager.start()
+    await tick()
+    expect(manager.getStatus().state).toBe(NatState.Discovering)
+    deps.hooks._fireReady()
+    await Promise.resolve()
+
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'route-b' })
+    firstDiscovery.resolve(UPNP_GATEWAY_STUB)
+    await starting
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(2)
+    expect(manager.getStatus().state).toBe(NatState.Active)
+    expect(manager.getStatus().gatewayInfo?.gatewayIp).toBe('10.0.0.254')
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
+  })
+})
+
 describe('NatManager public API', () => {
   let deps: TestDeps
   let manager: NatManager
@@ -714,7 +1314,7 @@ describe('NatManager mutex coalescing', () => {
     manager = new NatManager(deps)
   })
 
-  it('concurrent mapConfiguredPorts skips second call via dirty flag', async () => {
+  it('coalesces a concurrent mapConfiguredPorts call', async () => {
     const gate = Promise.withResolvers<void>()
     vi.mocked(deps.pmpPcpClient.pcpMap).mockImplementation(async () => {
       await gate.promise // block until test releases
@@ -726,19 +1326,18 @@ describe('NatManager mutex coalescing', () => {
     const first = manager.mapConfiguredPorts()
     // Yield so first call enters mutex
     await tick()
-    // Launch second — should coalesce (set dirty flag and return)
+    // Launch second — it shares the queue drain and requests one re-run.
     const second = manager.mapConfiguredPorts()
-    await second // second resolves immediately
 
     // Release the block
     gate.resolve()
-    await first
+    await Promise.all([first, second])
 
     expect(manager.getStatus().state).toBe(NatState.Active)
     expect(manager.getStatus().activeMappings).toHaveLength(2)
   })
 
-  it('dirty flag causes re-run after mutex release', async () => {
+  it('same-label queue entry causes one re-run after mutex release', async () => {
     const gate = Promise.withResolvers<void>()
     let callCount = 0
     vi.mocked(deps.pmpPcpClient.pcpMap).mockImplementation(async () => {
@@ -751,15 +1350,75 @@ describe('NatManager mutex coalescing', () => {
     // First call enters mutex, blocks at first pcpMap call
     const first = manager.mapConfiguredPorts()
     await tick()
-    // Second call: mutex is locked → sets dirty flag → returns immediately
-    manager.mapConfiguredPorts()
-    // Release gate: first call finishes, sees dirty, re-runs
+    // Second call coalesces to one pending map-configured entry.
+    const second = manager.mapConfiguredPorts()
+    // Release gate: first call finishes, then the pending entry re-runs.
     gate.resolve()
-    await first
+    await Promise.all([first, second])
 
     // First run: 2 ports. Re-run due to dirty: 2 more ports. Total = 4
     expect(callCount).toBe(4)
     expect(manager.getStatus().state).toBe(NatState.Active)
+  })
+
+  it('drains discovery queued while mapConfiguredPorts is running', async () => {
+    const gate = Promise.withResolvers<void>()
+    let mapCalls = 0
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockImplementation(async () => {
+      mapCalls++
+      if (mapCalls === 1) await gate.promise
+      return { ok: true, value: { externalPort: 6881, ttl: 7200 } }
+    })
+
+    await manager.start()
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(1)
+    const mapping = manager.mapConfiguredPorts()
+    await tick()
+
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'changed' })
+    await tick()
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(1)
+
+    gate.resolve()
+    await mapping
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(2)
+    expect(manager.getStatus().state).toBe(NatState.Active)
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
+  })
+
+  it('drains discovery queued while remapAll is running', async () => {
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockResolvedValue({
+      ok: true,
+      value: { externalPort: 6881, ttl: 7200 },
+    })
+    await manager.start()
+    await manager.mapConfiguredPorts()
+
+    const gate = Promise.withResolvers<void>()
+    let remapCalls = 0
+    vi.mocked(deps.pmpPcpClient.pcpMap).mockImplementation(async () => {
+      remapCalls++
+      if (remapCalls === 1) await gate.promise
+      return { ok: true, value: { externalPort: 6881, ttl: 7200 } }
+    })
+    const remapping = manager.remapAll()
+    await tick()
+
+    const onChange = vi.mocked(deps.networkMonitor.onChange).mock.calls[0]?.[0]
+    if (!onChange) throw new Error('network listener missing')
+    onChange({ hash: 'changed' })
+    await tick()
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(1)
+
+    gate.resolve()
+    await remapping
+
+    expect(deps.upnpClient.discover).toHaveBeenCalledTimes(2)
+    expect(manager.getStatus().state).toBe(NatState.Active)
+    expect(manager.getStatus().activeMappings).toHaveLength(2)
   })
 
   it('concurrent runDiscovery calls coalesce without warn', async () => {

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { UPNP_WANIP_V1 } from './codecs/index.js'
+import { isIpv4String, UPNP_WANIP_V1 } from './codecs/index.js'
 import { NatErrorCode } from './errors.js'
 import { natLogger } from './logger.js'
 import { GenerationGuard, TransitionMutex } from './state-machine.js'
@@ -35,6 +35,7 @@ export interface NatSettingsProvider {
 export interface UpnpClientLike {
   discover(opts?: {
     timeoutMs?: number
+    interfaceAddress?: string
   }): Promise<{ ok: boolean; value?: unknown; error?: unknown }>
   mapPort(
     gateway: unknown,
@@ -63,6 +64,7 @@ export interface PmpPcpClientLike {
     params: unknown
   ): Promise<{ ok: boolean; value?: unknown; error?: unknown }>
   setGatewayIp(ip: string): void
+  setNetworkRoute?(route: { gatewayIp: string; internalIp: string }): void
   close(): Promise<void>
 }
 
@@ -83,6 +85,11 @@ export interface NetworkMonitorLike {
   stop(): void
   onChange(listener: (snap: unknown) => void): () => void
   snapshot(): { gatewayIp: string; internalIp: string; hash: string }
+  verifiedSnapshot?(): Promise<{
+    gatewayIp: string
+    internalIp: string
+    hash: string
+  }>
 }
 
 export interface NatManagerHooks {
@@ -111,6 +118,11 @@ export interface NatManagerDeps {
   now?: () => number
 }
 
+interface QueuedTransition {
+  lifecycleEpoch: number
+  work: (lifecycleEpoch: number) => Promise<void>
+}
+
 export class NatManager {
   protected readonly deps: NatManagerDeps
   protected readonly mutex = new TransitionMutex()
@@ -135,7 +147,14 @@ export class NatManager {
   ]
   protected retryCount = 0
   protected retryTimer: NodeJS.Timeout | null = null
-  private readonly coalesceDirty = new Map<string, boolean>()
+  private readonly queuedWork = new Map<string, QueuedTransition>()
+  private queueDrain: Promise<void> | null = null
+  private stopInFlight: Promise<void> | null = null
+  private lifecycleEpoch = 0
+  private lifecycleActive = false
+  private networkRemapPending = false
+  private natPmpGatewayReady = false
+  private pcpRouteReady = false
 
   constructor(deps: NatManagerDeps) {
     this.deps = deps
@@ -156,6 +175,8 @@ export class NatManager {
   }
 
   async start(): Promise<void> {
+    const stopping = this.stopInFlight
+    if (stopping) await stopping
     const nat = this.deps.settingsProvider.getNat()
     const engine = this.deps.settingsProvider.getEngine()
     // Reset retry budget on every explicit start so user-triggered enable()
@@ -180,6 +201,11 @@ export class NatManager {
       'NatManager.start: entering'
     )
     if (!nat.enabled) {
+      this.lifecycleActive = false
+      this.lifecycleEpoch++
+      this.queuedWork.clear()
+      this.gen.bump()
+      this.networkRemapPending = false
       this.setState(NatState.Stopped)
       log.info(
         { state: this.state },
@@ -187,6 +213,7 @@ export class NatManager {
       )
       return
     }
+    this.lifecycleActive = true
     this.subscribeToBus()
     log.debug(
       { subscribers: this.unsubscribers.length },
@@ -212,9 +239,37 @@ export class NatManager {
     )
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.stopInFlight) return this.stopInFlight
+    const task = Promise.resolve().then(() => this.doStop())
+    this.stopInFlight = task
+    void task.then(
+      () => {
+        if (this.stopInFlight === task) this.stopInFlight = null
+      },
+      () => {
+        if (this.stopInFlight === task) this.stopInFlight = null
+      }
+    )
+    return task
+  }
+
+  private async doStop(): Promise<void> {
     const beforeState = this.state
     const beforeMappingCount = this.activeMappings.length
+    const mappingsToUnmap = [...this.activeMappings]
+    const gatewayForUnmap = this.gatewayInfo
+    const droppedTransitions = this.queuedWork.size
+    this.lifecycleActive = false
+    this.lifecycleEpoch++
+    const stopEpoch = this.lifecycleEpoch
+    this.queuedWork.clear()
+    this.networkRemapPending = false
+    this.natPmpGatewayReady = false
+    this.pcpRouteReady = false
+    this.activeMappings = []
+    this.gatewayInfo = null
+    this.stickyProtocol = null
     // Invalidate any in-flight discovery before its trailing setState writes
     // can resurrect us from Stopped — the generation guard inside doDiscovery
     // honours this bump on every isCurrent() checkpoint.
@@ -229,6 +284,7 @@ export class NatManager {
         hasRenewalTimer: this.renewalTimer !== null,
         hasAbortController: this.abortController !== null,
         subscribers: this.unsubscribers.length,
+        droppedTransitions,
       },
       'NatManager.stop: entering'
     )
@@ -260,9 +316,9 @@ export class NatManager {
     // Best-effort: each mapping is independent, so one failure must not block
     // the rest or prevent shutdown.
     let unmappedCount = 0
-    for (const mapping of this.activeMappings) {
+    for (const mapping of mappingsToUnmap) {
       try {
-        await this.unmapOne(mapping)
+        await this.unmapOne(mapping, gatewayForUnmap)
         unmappedCount++
       } catch (err) {
         log.warn(
@@ -282,10 +338,9 @@ export class NatManager {
       pmpPcpClosed = false
       log.warn({ err }, 'pmpPcp close failed')
     }
-    this.activeMappings = []
-    this.gatewayInfo = null
-    this.stickyProtocol = null
-    this.setState(NatState.Stopped)
+    if (this.lifecycleEpoch === stopEpoch && !this.lifecycleActive) {
+      this.setState(NatState.Stopped)
+    }
     log.info(
       {
         previousState: beforeState,
@@ -294,6 +349,7 @@ export class NatManager {
         renewalTimerCleared: renewalWasActive,
         aborted,
         releasedSubscribers: subscriberCount,
+        droppedTransitions,
         pmpPcpClosed,
         state: this.state,
       },
@@ -313,22 +369,56 @@ export class NatManager {
     this.deps.onEvent({ type: 'error', error: { code, message } })
   }
 
-  /**
-   * Push the learned gateway address into PmpPcpClient so subsequent
-   * NAT-PMP / PCP packets target the real gateway rather than the
-   * placeholder the factory used at construction. Silently tolerates
-   * malformed inputs from discovery (logs + keeps previous value) rather
-   * than propagating the RangeError up the discovery path.
-   */
-  protected syncPmpPcpGatewayIp(ip: string | undefined | null): void {
-    if (!ip) return
+  /** Push one discovery round's gateway and client address into PMP/PCP. */
+  protected syncPmpPcpNetworkRoute(route: {
+    gatewayIp: string | undefined | null
+    internalIp: string | undefined | null
+  }): boolean {
+    this.natPmpGatewayReady = false
+    this.pcpRouteReady = false
+    if (
+      !route.gatewayIp ||
+      route.gatewayIp === '0.0.0.0' ||
+      !isIpv4String(route.gatewayIp)
+    ) {
+      return false
+    }
+
+    const hasValidInternalIp =
+      Boolean(route.internalIp) &&
+      route.internalIp !== '0.0.0.0' &&
+      isIpv4String(route.internalIp as string)
+    if (hasValidInternalIp && this.deps.pmpPcpClient.setNetworkRoute) {
+      try {
+        this.deps.pmpPcpClient.setNetworkRoute({
+          gatewayIp: route.gatewayIp,
+          internalIp: route.internalIp as string,
+        })
+        this.natPmpGatewayReady = true
+        this.pcpRouteReady = true
+        return true
+      } catch (err) {
+        log.warn(
+          { err, gatewayIp: route.gatewayIp, internalIp: route.internalIp },
+          'syncPmpPcpNetworkRoute: atomic route update failed; falling back to gateway-only mode'
+        )
+      }
+    }
+
     try {
-      this.deps.pmpPcpClient.setGatewayIp(ip)
+      this.deps.pmpPcpClient.setGatewayIp(route.gatewayIp)
+      this.natPmpGatewayReady = true
+      log.debug(
+        { gatewayIp: route.gatewayIp },
+        'PMP/PCP adapter is in gateway-only mode; PCP is disabled'
+      )
+      return true
     } catch (err) {
       log.warn(
-        { err, ip },
-        'syncPmpPcpGatewayIp: discovery produced invalid gateway IP'
+        { err, gatewayIp: route.gatewayIp },
+        'syncPmpPcpNetworkRoute: gateway update failed'
       )
+      return false
     }
   }
 
@@ -370,11 +460,46 @@ export class NatManager {
     })
 
     const netOff = this.deps.networkMonitor.onChange((snap: unknown) => {
-      log.info({ snap }, 'network change detected — re-discovering')
-      void this.runDiscovery()
+      this.handleNetworkChange(snap)
     })
 
     this.unsubscribers.push(settingsOff, readyOff, netOff)
+  }
+
+  private handleNetworkChange(snap: unknown): void {
+    if (!this.lifecycleActive) return
+    const shouldRemap =
+      this.networkRemapPending ||
+      this.activeMappings.length > 0 ||
+      this.queuedWork.has('map-configured') ||
+      this.queuedWork.has('remap-all') ||
+      this.state === NatState.Mapping ||
+      this.state === NatState.Active
+    const hadVisibleMappings = this.activeMappings.length > 0
+
+    // A topology change invalidates every transition created for the old
+    // route. Keep the lifecycle active, then enqueue a fresh discovery in the
+    // new epoch behind whichever transition is currently unwinding.
+    this.lifecycleEpoch++
+    this.queuedWork.clear()
+    this.gen.bump()
+    this.abortController?.abort()
+    this.clearRenewalTimer()
+    this.networkRemapPending ||= shouldRemap
+    this.activeMappings = []
+    this.gatewayInfo = null
+    this.stickyProtocol = null
+    this.natPmpGatewayReady = false
+    this.pcpRouteReady = false
+    if (hadVisibleMappings) {
+      this.deps.onEvent({ type: 'mapping-updated', mappings: [] })
+    }
+
+    log.info(
+      { snap, shouldRemap, hadVisibleMappings },
+      'network change invalidated the previous route; re-discovering'
+    )
+    void this.runDiscovery()
   }
 
   private async handleSettingsChanged(): Promise<void> {
@@ -400,22 +525,27 @@ export class NatManager {
     }
   }
 
-  private async unmapOne(mapping: NatMapping): Promise<void> {
-    if (
-      mapping.method === NatProtocol.Upnp &&
-      this.gatewayInfo?.controlUrl &&
-      this.gatewayInfo.controlHost &&
-      this.gatewayInfo.controlPort
-    ) {
+  private async unmapOne(
+    mapping: NatMapping,
+    gatewayInfo: NatGatewayInfo | null = this.gatewayInfo
+  ): Promise<void> {
+    if (mapping.method === NatProtocol.Upnp) {
+      if (
+        !gatewayInfo?.controlUrl ||
+        !gatewayInfo.controlHost ||
+        !gatewayInfo.controlPort
+      ) {
+        return
+      }
       await this.deps.upnpClient.unmapPort(
         {
-          gatewayIp: this.gatewayInfo.gatewayIp,
-          controlUrl: this.gatewayInfo.controlUrl,
-          controlHost: this.gatewayInfo.controlHost,
-          controlPort: this.gatewayInfo.controlPort,
+          gatewayIp: gatewayInfo.gatewayIp,
+          controlUrl: gatewayInfo.controlUrl,
+          controlHost: gatewayInfo.controlHost,
+          controlPort: gatewayInfo.controlPort,
           serviceType: UPNP_WANIP_V1,
-          manufacturer: this.gatewayInfo.manufacturer ?? '',
-          modelName: this.gatewayInfo.modelName ?? '',
+          manufacturer: gatewayInfo.manufacturer ?? '',
+          modelName: gatewayInfo.modelName ?? '',
         },
         {
           externalPort: mapping.externalPort,
@@ -434,7 +564,7 @@ export class NatManager {
           ? Buffer.from(mapping.pcpNonce, 'hex')
           : undefined,
       })
-    } else {
+    } else if (mapping.method === NatProtocol.NatPmp) {
       // NAT-PMP: ttl=0 means "remove" per RFC 6886 §3.3
       await this.deps.pmpPcpClient.natPmpMap({
         protocol: mapping.protocol,
@@ -445,55 +575,185 @@ export class NatManager {
     }
   }
 
+  private async discardStaleMappings(
+    mappings: NatMapping[],
+    gatewayInfo: NatGatewayInfo | null
+  ): Promise<void> {
+    let pmpCleanupAttempted = false
+    for (const mapping of mappings) {
+      if (
+        mapping.method === NatProtocol.Pcp ||
+        mapping.method === NatProtocol.NatPmp
+      ) {
+        pmpCleanupAttempted = true
+      }
+      try {
+        await this.unmapOne(mapping, gatewayInfo)
+      } catch (err) {
+        log.warn(
+          { err, port: mapping.internalPort, method: mapping.method },
+          'failed to discard mapping from a stopped lifecycle'
+        )
+      }
+    }
+    if (pmpCleanupAttempted) {
+      try {
+        // A stale cleanup may run after stop() closed the shared UDP client.
+        // Close again so its one final delete request cannot leave a reopened
+        // socket or cleanup timer behind in the stopped lifecycle.
+        await this.deps.pmpPcpClient.close()
+      } catch (err) {
+        log.warn({ err }, 'failed to close PMP/PCP client after stale cleanup')
+      }
+    }
+  }
+
   /**
-   * Run `work` under the shared mutex with coalescing: if the mutex is already
-   * held, set a dirty flag so the current holder re-runs after completing.
-   * Eliminates contention warnings during cold-start and network-change bursts.
+   * Queue work by label, coalescing duplicate labels while preserving ordering
+   * across different labels. One drain owns the mutex, so a network discovery
+   * queued during mapping/remapping cannot be lost when that holder releases.
    */
   private async runCoalesced(
     label: string,
-    work: () => Promise<void>
+    work: (lifecycleEpoch: number) => Promise<void>
   ): Promise<void> {
-    if (this.mutex.isLocked) {
-      this.coalesceDirty.set(label, true)
-      log.debug(
-        { currentHolder: this.mutex.currentHolder },
-        `${label}: coalesced (mutex busy, will re-run after current)`
-      )
+    if (!this.lifecycleActive) {
+      log.debug({ label }, 'transition ignored while NAT lifecycle is stopped')
       return
     }
-    do {
-      this.coalesceDirty.set(label, false)
-      const caller = `${label}@${this.now()}`
+    const lifecycleEpoch = this.lifecycleEpoch
+    const alreadyQueued = this.queuedWork.has(label)
+    this.queuedWork.set(label, { lifecycleEpoch, work })
+    if (alreadyQueued || this.mutex.currentHolder?.startsWith(`${label}@`)) {
       log.debug(
-        { caller, currentHolder: this.mutex.currentHolder },
-        `${label}: attempting mutex`
+        { currentHolder: this.mutex.currentHolder },
+        `${label}: coalesced in transition queue`
       )
-      try {
-        await this.mutex.runExclusive(async () => {
-          log.debug({ caller }, `${label}: mutex acquired`)
-          await work()
-        }, caller)
-        log.debug({ caller }, `${label}: mutex released`)
-      } catch {
-        // TOCTOU: mutex was free at the isLocked check but acquired before
-        // runExclusive. Mark dirty so the holder picks it up.
-        this.coalesceDirty.set(label, true)
+    }
+
+    if (!this.queueDrain) {
+      // Start on the next microtask so queueDrain is installed before work can
+      // synchronously re-enter through a state/event callback.
+      this.queueDrain = Promise.resolve().then(() => this.drainQueuedWork())
+    }
+    await this.queueDrain
+  }
+
+  private async drainQueuedWork(): Promise<void> {
+    try {
+      while (this.queuedWork.size > 0) {
+        const next = this.queuedWork.entries().next()
+        if (next.done) return
+        const [label, transition] = next.value
+        this.queuedWork.delete(label)
+        if (!this.isLifecycleCurrent(transition.lifecycleEpoch)) {
+          log.debug(
+            { label, lifecycleEpoch: transition.lifecycleEpoch },
+            'discarding stale queued transition'
+          )
+          continue
+        }
+        const caller = `${label}@${this.now()}`
         log.debug(
           { caller, currentHolder: this.mutex.currentHolder },
-          `${label}: mutex race, will retry`
+          `${label}: draining transition queue`
         )
-        return
+        try {
+          await this.mutex.runExclusive(async () => {
+            log.debug({ caller }, `${label}: mutex acquired`)
+            if (!this.isLifecycleCurrent(transition.lifecycleEpoch)) return
+            await transition.work(transition.lifecycleEpoch)
+          }, caller)
+          log.debug({ caller }, `${label}: mutex released`)
+        } catch (err) {
+          log.warn(
+            { err, caller, currentHolder: this.mutex.currentHolder },
+            `${label}: queued transition failed`
+          )
+        }
       }
-    } while (this.coalesceDirty.get(label))
+    } finally {
+      this.queueDrain = null
+    }
+  }
+
+  private isLifecycleCurrent(lifecycleEpoch: number): boolean {
+    return this.lifecycleActive && lifecycleEpoch === this.lifecycleEpoch
   }
 
   protected async runDiscovery(): Promise<void> {
-    await this.runCoalesced('discovery', () => this.doDiscovery())
+    await this.runCoalesced('discovery', (lifecycleEpoch) =>
+      this.doDiscoveryTransition(lifecycleEpoch)
+    )
   }
 
-  private async doDiscovery(): Promise<void> {
+  private async doDiscoveryTransition(lifecycleEpoch: number): Promise<void> {
+    await this.doDiscovery(lifecycleEpoch)
+    if (!this.isLifecycleCurrent(lifecycleEpoch) || !this.networkRemapPending) {
+      return
+    }
+
+    if (this.state === NatState.Ready) {
+      this.consumeSatisfiedMappingTransitions(lifecycleEpoch)
+      // Stay inside the current queue/mutex transition. Calling the public
+      // method here would await this same drain and deadlock.
+      await this.doMapConfiguredPorts(lifecycleEpoch)
+    }
+    if (!this.isLifecycleCurrent(lifecycleEpoch)) return
+    if (this.state === NatState.Active) {
+      // ready/config/remap events can arrive while either mapping request is
+      // awaiting I/O. The successful B mapping satisfies those same-epoch
+      // intents too; consume them with no further await before clearing the
+      // remap marker and returning to the queue drain.
+      this.consumeSatisfiedMappingTransitions(lifecycleEpoch)
+      this.networkRemapPending = false
+      return
+    }
+
+    // Discovery or immediate remapping on the new route failed. Keep the
+    // remap intent for the retry cycle, but never expose the previous route's
+    // gateway or mappings in the meantime.
+    this.clearRenewalTimer()
+    this.activeMappings = []
+    this.gatewayInfo = null
+    this.stickyProtocol = null
+    this.natPmpGatewayReady = false
+    this.pcpRouteReady = false
+  }
+
+  private consumeSatisfiedMappingTransitions(lifecycleEpoch: number): void {
+    for (const label of ['map-configured', 'remap-all']) {
+      const queued = this.queuedWork.get(label)
+      if (queued?.lifecycleEpoch === lifecycleEpoch) {
+        this.queuedWork.delete(label)
+        log.debug(
+          { label, lifecycleEpoch },
+          'direct post-discovery mapping consumed queued transition'
+        )
+      }
+    }
+  }
+
+  private async readVerifiedNetworkSnapshot(): Promise<{
+    gatewayIp: string
+    internalIp: string
+    hash: string
+  }> {
+    try {
+      return this.deps.networkMonitor.verifiedSnapshot
+        ? await this.deps.networkMonitor.verifiedSnapshot()
+        : this.deps.networkMonitor.snapshot()
+    } catch (err) {
+      log.warn({ err }, 'verified route snapshot failed; using cached snapshot')
+      return this.deps.networkMonitor.snapshot()
+    }
+  }
+
+  private async doDiscovery(lifecycleEpoch: number): Promise<void> {
+    if (!this.isLifecycleCurrent(lifecycleEpoch)) return
     this.setState(NatState.Discovering)
+    this.natPmpGatewayReady = false
+    this.pcpRouteReady = false
     const generation = this.gen.bump()
     this.abortController?.abort()
     this.abortController = new AbortController()
@@ -501,10 +761,23 @@ export class NatManager {
     // Phase 1 discovery: try UPnP first; NAT-PMP/PCP probe is a fast
     // UDP request and does not establish gateway info for SOAP, so treat
     // UPnP as primary.
+    const network = await this.readVerifiedNetworkSnapshot()
+    if (
+      !this.isLifecycleCurrent(lifecycleEpoch) ||
+      !this.gen.isCurrent(generation)
+    ) {
+      return
+    }
     const upnp = await this.deps.upnpClient.discover({
       timeoutMs: 3000,
+      ...(network.internalIp ? { interfaceAddress: network.internalIp } : {}),
     })
-    if (!this.gen.isCurrent(generation)) return
+    if (
+      !this.isLifecycleCurrent(lifecycleEpoch) ||
+      !this.gen.isCurrent(generation)
+    ) {
+      return
+    }
     if (upnp.ok && upnp.value) {
       const g = upnp.value as {
         gatewayIp: string
@@ -516,7 +789,7 @@ export class NatManager {
         modelName: string
       }
       this.gatewayInfo = {
-        internalIp: this.deps.networkMonitor.snapshot().internalIp,
+        internalIp: network.internalIp,
         gatewayIp: g.gatewayIp,
         externalIp: null,
         controlUrl: g.controlUrl,
@@ -526,38 +799,60 @@ export class NatManager {
         modelName: g.modelName,
         supportedProtocols: [NatProtocol.Upnp],
       }
-      this.syncPmpPcpGatewayIp(g.gatewayIp)
+      this.syncPmpPcpNetworkRoute({
+        gatewayIp: g.gatewayIp,
+        internalIp: network.internalIp,
+      })
       this.deps.onEvent({ type: 'gateway-changed', info: this.gatewayInfo })
       this.setState(NatState.Ready)
       return
     }
 
     // Fall back to NAT-PMP probe
-    const pmp = await this.deps.pmpPcpClient.natPmpGetExternalIp({
-      timeoutMs: 1000,
-    })
-    if (!this.gen.isCurrent(generation)) return
-    if (pmp.ok) {
-      const snap = this.deps.networkMonitor.snapshot()
-      const pmpVal = pmp.value as { externalIp?: string } | undefined
-      this.gatewayInfo = {
-        internalIp: snap.internalIp,
-        gatewayIp: snap.gatewayIp,
-        externalIp: pmpVal?.externalIp ?? null,
-        controlUrl: null,
-        controlHost: null,
-        controlPort: null,
-        manufacturer: null,
-        modelName: null,
-        supportedProtocols: [NatProtocol.NatPmp],
-      }
-      this.syncPmpPcpGatewayIp(snap.gatewayIp)
-      this.deps.onEvent({ type: 'gateway-changed', info: this.gatewayInfo })
-      this.setState(NatState.Ready)
+    // The topology can change while UPnP awaits its timeout. Verify the route
+    // again so PMP never reuses a newly-created interface heuristic.
+    const pmpNetwork = await this.readVerifiedNetworkSnapshot()
+    if (
+      !this.isLifecycleCurrent(lifecycleEpoch) ||
+      !this.gen.isCurrent(generation)
+    ) {
       return
     }
+    if (this.syncPmpPcpNetworkRoute(pmpNetwork)) {
+      const pmp = await this.deps.pmpPcpClient.natPmpGetExternalIp({
+        timeoutMs: 1000,
+      })
+      if (
+        !this.isLifecycleCurrent(lifecycleEpoch) ||
+        !this.gen.isCurrent(generation)
+      ) {
+        return
+      }
+      if (pmp.ok) {
+        const pmpVal = pmp.value as { externalIp?: string } | undefined
+        this.gatewayInfo = {
+          internalIp: pmpNetwork.internalIp,
+          gatewayIp: pmpNetwork.gatewayIp,
+          externalIp: pmpVal?.externalIp ?? null,
+          controlUrl: null,
+          controlHost: null,
+          controlPort: null,
+          manufacturer: null,
+          modelName: null,
+          supportedProtocols: [NatProtocol.NatPmp],
+        }
+        this.deps.onEvent({ type: 'gateway-changed', info: this.gatewayInfo })
+        this.setState(NatState.Ready)
+        return
+      }
+    }
 
-    if (!this.gen.isCurrent(generation)) return
+    if (
+      !this.isLifecycleCurrent(lifecycleEpoch) ||
+      !this.gen.isCurrent(generation)
+    ) {
+      return
+    }
     this.setLastError(
       NatErrorCode.DiscoveryFailed,
       'all discovery attempts failed'
@@ -565,9 +860,15 @@ export class NatManager {
     this.setState(NatState.Failed)
   }
 
-  private async doMapConfiguredPorts(): Promise<void> {
-    if (this.state !== NatState.Ready && this.state !== NatState.Active) return
+  private async doMapConfiguredPorts(lifecycleEpoch: number): Promise<void> {
+    if (
+      !this.isLifecycleCurrent(lifecycleEpoch) ||
+      (this.state !== NatState.Ready && this.state !== NatState.Active)
+    ) {
+      return
+    }
     const engine = this.deps.settingsProvider.getEngine()
+    const cleanupGateway = this.gatewayInfo
     const ports: Array<{
       port: number
       purpose: NatMappingPurpose
@@ -579,8 +880,22 @@ export class NatManager {
     this.setState(NatState.Mapping)
     const newMappings: NatMapping[] = []
     for (const p of ports) {
-      const mapping = await this.mapOne(p.port, p.protocol, p.purpose)
+      const mapping = await this.mapOne(
+        lifecycleEpoch,
+        p.port,
+        p.protocol,
+        p.purpose
+      )
+      if (!this.isLifecycleCurrent(lifecycleEpoch)) {
+        await this.discardStaleMappings(
+          mapping ? [...newMappings, mapping] : newMappings,
+          cleanupGateway
+        )
+        return
+      }
       if (!mapping) {
+        await this.discardStaleMappings(newMappings, cleanupGateway)
+        if (!this.isLifecycleCurrent(lifecycleEpoch)) return
         this.setLastError(
           NatErrorCode.MappingFailed,
           `all protocols failed for port ${p.port}`
@@ -600,63 +915,74 @@ export class NatManager {
   }
 
   async mapConfiguredPorts(): Promise<void> {
-    await this.runCoalesced('map-configured', () => this.doMapConfiguredPorts())
+    await this.runCoalesced('map-configured', (lifecycleEpoch) =>
+      this.doMapConfiguredPorts(lifecycleEpoch)
+    )
   }
 
   async remapAll(): Promise<void> {
-    const caller = `remap-all@${this.now()}`
-    log.debug(
-      { caller, currentHolder: this.mutex.currentHolder },
-      'remapAll: attempting mutex'
+    await this.runCoalesced('remap-all', (lifecycleEpoch) =>
+      this.doRemapAll(lifecycleEpoch)
     )
-    try {
-      await this.mutex.runExclusive(async () => {
-        log.debug({ caller }, 'remapAll: mutex acquired')
-        if (this.activeMappings.length === 0) {
-          await this.doMapConfiguredPorts()
+  }
+
+  private async doRemapAll(lifecycleEpoch: number): Promise<void> {
+    if (!this.isLifecycleCurrent(lifecycleEpoch)) return
+    if (this.activeMappings.length === 0) {
+      await this.doMapConfiguredPorts(lifecycleEpoch)
+      return
+    }
+    const cleanupGateway = this.gatewayInfo
+    const refreshed: NatMapping[] = []
+    for (const existing of this.activeMappings) {
+      const mapping = await this.mapOne(
+        lifecycleEpoch,
+        existing.internalPort,
+        existing.protocol,
+        existing.purpose,
+        {
+          preferred: existing.method,
+          ...(existing.pcpNonce ? { existingNonce: existing.pcpNonce } : {}),
+        }
+      )
+      if (!this.isLifecycleCurrent(lifecycleEpoch)) {
+        await this.discardStaleMappings(
+          mapping ? [...refreshed, mapping] : refreshed,
+          cleanupGateway
+        )
+        return
+      }
+      if (!mapping) {
+        // Partial failure: invalidate sticky protocol and attempt full fallback
+        this.stickyProtocol = null
+        const retry = await this.mapOne(
+          lifecycleEpoch,
+          existing.internalPort,
+          existing.protocol,
+          existing.purpose
+        )
+        if (!this.isLifecycleCurrent(lifecycleEpoch)) {
+          await this.discardStaleMappings(
+            retry ? [...refreshed, retry] : refreshed,
+            cleanupGateway
+          )
           return
         }
-        const refreshed: NatMapping[] = []
-        for (const existing of this.activeMappings) {
-          const mapping = await this.mapOne(
-            existing.internalPort,
-            existing.protocol,
-            existing.purpose,
-            {
-              preferred: existing.method,
-              ...(existing.pcpNonce
-                ? { existingNonce: existing.pcpNonce }
-                : {}),
-            }
-          )
-          if (!mapping) {
-            // Partial failure: invalidate sticky protocol and attempt full fallback
-            this.stickyProtocol = null
-            const retry = await this.mapOne(
-              existing.internalPort,
-              existing.protocol,
-              existing.purpose
-            )
-            if (!retry) {
-              this.setState(NatState.Failed)
-              return
-            }
-            refreshed.push(retry)
-          } else {
-            refreshed.push(mapping)
-          }
+        if (!retry) {
+          this.setState(NatState.Failed)
+          return
         }
-        this.activeMappings = refreshed
-        this.deps.onEvent({
-          type: 'mapping-updated',
-          mappings: [...this.activeMappings],
-        })
-        this.scheduleRenewal()
-      }, caller)
-      log.debug({ caller }, 'remapAll: mutex released')
-    } catch (err) {
-      log.warn({ err, caller }, 'remapAll mutex contention')
+        refreshed.push(retry)
+      } else {
+        refreshed.push(mapping)
+      }
     }
+    this.activeMappings = refreshed
+    this.deps.onEvent({
+      type: 'mapping-updated',
+      mappings: [...this.activeMappings],
+    })
+    this.scheduleRenewal()
   }
 
   protected scheduleRenewal(): void {
@@ -680,6 +1006,7 @@ export class NatManager {
   }
 
   private async mapOne(
+    lifecycleEpoch: number,
     internalPort: number,
     protocol: NatTransportProtocol,
     purpose: NatMappingPurpose,
@@ -702,17 +1029,6 @@ export class NatManager {
         existingNonce
       )
       if (result) {
-        this.stickyProtocol = proto
-        // SPEC FIX: warn when NAT-PMP is SELECTED (success), not when it fails
-        if (proto === NatProtocol.NatPmp) {
-          this.deps.onEvent({
-            type: 'error',
-            error: {
-              code: 'NAT_SECURITY_WARNING',
-              message: 'NAT-PMP selected; responses are unauthenticated',
-            },
-          })
-        }
         const mapping: NatMapping = {
           internalPort,
           externalPort: result.externalPort,
@@ -725,8 +1041,21 @@ export class NatManager {
           lastRenewedAt: this.now(),
         }
         if (result.pcpNonce) mapping.pcpNonce = result.pcpNonce
+        if (!this.isLifecycleCurrent(lifecycleEpoch)) return mapping
+        this.stickyProtocol = proto
+        // SPEC FIX: warn when NAT-PMP is SELECTED (success), not when it fails
+        if (proto === NatProtocol.NatPmp) {
+          this.deps.onEvent({
+            type: 'error',
+            error: {
+              code: 'NAT_SECURITY_WARNING',
+              message: 'NAT-PMP selected; responses are unauthenticated',
+            },
+          })
+        }
         return mapping
       }
+      if (!this.isLifecycleCurrent(lifecycleEpoch)) return null
     }
     return null
   }
@@ -741,6 +1070,7 @@ export class NatManager {
     try {
       switch (proto) {
         case NatProtocol.Pcp: {
+          if (!this.pcpRouteReady) return null
           const r = await this.deps.pmpPcpClient.pcpMap({
             internalPort,
             externalPort: internalPort,
@@ -767,6 +1097,7 @@ export class NatManager {
           return mapped
         }
         case NatProtocol.NatPmp: {
+          if (!this.natPmpGatewayReady) return null
           const r = await this.deps.pmpPcpClient.natPmpMap({
             protocol,
             internalPort,
@@ -789,6 +1120,7 @@ export class NatManager {
             !info?.controlUrl ||
             !info.controlHost ||
             !info.controlPort ||
+            !info.internalIp ||
             info.controlPort < 1 ||
             info.controlPort > 65535
           ) {
@@ -805,7 +1137,7 @@ export class NatManager {
               modelName: info.modelName ?? '',
             },
             {
-              internalIp: this.deps.networkMonitor.snapshot().internalIp,
+              internalIp: info.internalIp,
               internalPort,
               externalPort: internalPort,
               protocol,
