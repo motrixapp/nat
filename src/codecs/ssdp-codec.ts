@@ -96,10 +96,9 @@ export function parseMSearchResponse(raw: Buffer): ParseResult<SsdpResponse> {
     if (value.length > SSDP_HEADER_VALUE_MAX) {
       return parseErr(NatErrorCode.SecurityViolation, 'header value too long')
     }
-    // Dot is required: UPnP 1.1 (UDA §1.2.2) mandates BOOTID.UPNP.ORG /
-    // CONFIGID.UPNP.ORG on every advertisement, and '.' is a legal RFC 9110
-    // token character — without it every spec-compliant IGD is rejected.
-    if (!/^[A-Za-z0-9.-]+$/.test(name)) {
+    // HTTP field names use RFC 9110 §5.6.2 tchar, including vendor headers
+    // such as Huawei's HILINK_EXT and UPnP's BOOTID.UPNP.ORG.
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) {
       return parseErr(NatErrorCode.ParseError, 'invalid header name')
     }
     headers[name] = value
