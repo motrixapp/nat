@@ -68,7 +68,10 @@ export interface PcpMapOptions {
 
 export class PmpPcpClient {
   private socket: UdpSocket | null = null
-  private socketReady: Promise<void> | null = null
+  private socketReady: Promise<UdpSocket> | null = null
+  private cancelSocketReady: (() => void) | null = null
+  private socketGeneration = 0
+  private closing: Promise<void> | null = null
   private readonly udpFactory: UdpSocketFactory
   private gatewayIp: string
   private clientIp: Buffer
@@ -184,7 +187,21 @@ export class PmpPcpClient {
   }
 
   async pcpMap(params: PcpMapOptions): Promise<ParseResult<PcpMapResponse>> {
-    await this.ensureSocket()
+    const generation = this.socketGeneration
+    let socket: UdpSocket
+    try {
+      socket = await this.ensureSocket()
+    } catch (error) {
+      return parseErr(
+        generation === this.socketGeneration
+          ? NatErrorCode.GatewayUnreachable
+          : NatErrorCode.NetworkChanged,
+        (error as Error).message
+      )
+    }
+    if (socket !== this.socket) {
+      return parseErr(NatErrorCode.NetworkChanged, 'client closing')
+    }
     if (this.pendingNonces.size >= MAX_CONCURRENT_REQUESTS) {
       return parseErr(
         NatErrorCode.ProtocolRejected,
@@ -208,6 +225,12 @@ export class PmpPcpClient {
       return parseErr(NatErrorCode.ProtocolRejected, (err as Error).message)
     }
     const key = nonce.toString('hex')
+    if (this.pendingNonces.has(key)) {
+      return parseErr(
+        NatErrorCode.ProtocolRejected,
+        'pcp nonce already in flight'
+      )
+    }
     const timeoutMs = Math.max(
       1,
       params.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
@@ -217,7 +240,8 @@ export class PmpPcpClient {
       let onAbort: (() => void) | null = null
 
       const timer = setTimeout(() => {
-        if (this.pendingNonces.delete(key)) {
+        if (this.pendingNonces.get(key) === entry) {
+          this.pendingNonces.delete(key)
           if (onAbort && params.signal) {
             params.signal.removeEventListener('abort', onAbort)
           }
@@ -241,7 +265,8 @@ export class PmpPcpClient {
 
       if (params.signal) {
         onAbort = () => {
-          if (this.pendingNonces.delete(key)) {
+          if (this.pendingNonces.get(key) === entry) {
+            this.pendingNonces.delete(key)
             clearTimeout(timer)
             resolve(parseErr(NatErrorCode.Timeout, 'aborted'))
           }
@@ -253,9 +278,9 @@ export class PmpPcpClient {
         params.signal.addEventListener('abort', onAbort, { once: true })
       }
 
-      // biome-ignore lint/style/noNonNullAssertion: socket guaranteed by ensureSocket()
-      this.socket!.send(request, NATPMP_PORT, this.gatewayIp).catch((err) => {
-        if (this.pendingNonces.delete(key)) {
+      socket.send(request, NATPMP_PORT, this.gatewayIp).catch((err) => {
+        if (this.pendingNonces.get(key) === entry) {
+          this.pendingNonces.delete(key)
           clearTimeout(timer)
           if (onAbort && params.signal) {
             params.signal.removeEventListener('abort', onAbort)
@@ -268,7 +293,15 @@ export class PmpPcpClient {
     })
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    // Detach the old generation before awaiting I/O. New discovery may open
+    // another socket while this one is still closing.
+    const socket = this.socket
+    this.socket = null
+    this.socketReady = null
+    this.socketGeneration++
+    this.cancelSocketReady?.()
+    this.cancelSocketReady = null
     // Reject all pending
     for (const [, pending] of this.pendingNonces) {
       pending.resolve(parseErr(NatErrorCode.NetworkChanged, 'client closing'))
@@ -285,11 +318,17 @@ export class PmpPcpClient {
       clearInterval(this.nonceCleanupTimer)
       this.nonceCleanupTimer = null
     }
-    if (this.socket) {
-      await this.socket.close()
-      this.socket = null
-      this.socketReady = null
-    }
+    if (!socket) return this.closing ?? Promise.resolve()
+    const closing = Promise.all([
+      this.closing,
+      Promise.resolve().then(() => socket.close()),
+    ])
+      .then(() => {})
+      .finally(() => {
+        if (this.closing === closing) this.closing = null
+      })
+    this.closing = closing
+    return closing
   }
 
   private async sendNatPmp(
@@ -297,7 +336,21 @@ export class PmpPcpClient {
     expectedOpcode: number,
     options: { timeoutMs?: number; signal?: AbortSignal }
   ): Promise<ParseResult<NatPmpResponse>> {
-    await this.ensureSocket()
+    const generation = this.socketGeneration
+    let socket: UdpSocket
+    try {
+      socket = await this.ensureSocket()
+    } catch (error) {
+      return parseErr(
+        generation === this.socketGeneration
+          ? NatErrorCode.GatewayUnreachable
+          : NatErrorCode.NetworkChanged,
+        (error as Error).message
+      )
+    }
+    if (socket !== this.socket) {
+      return parseErr(NatErrorCode.NetworkChanged, 'client closing')
+    }
     if (this.pendingPmp) {
       return parseErr(NatErrorCode.ProtocolRejected, 'natpmp request in flight')
     }
@@ -322,22 +375,23 @@ export class PmpPcpClient {
       }
 
       const timer = setTimeout(() => {
-        if (this.pendingPmp) {
+        if (this.pendingPmp === entry) {
           this.pendingPmp = null
           wrappedResolve(parseErr(NatErrorCode.Timeout, 'natpmp timeout'))
         }
       }, timeoutMs)
       timer.unref?.()
 
-      this.pendingPmp = {
+      const entry: PendingPmp = {
         opcode: expectedOpcode,
         resolve: wrappedResolve,
         timer,
       }
+      this.pendingPmp = entry
 
       if (options.signal) {
         onAbort = () => {
-          if (this.pendingPmp) {
+          if (this.pendingPmp === entry) {
             clearTimeout(this.pendingPmp.timer)
             this.pendingPmp = null
             wrappedResolve(parseErr(NatErrorCode.Timeout, 'aborted'))
@@ -350,9 +404,8 @@ export class PmpPcpClient {
         options.signal.addEventListener('abort', onAbort, { once: true })
       }
 
-      // biome-ignore lint/style/noNonNullAssertion: socket guaranteed by ensureSocket()
-      this.socket!.send(request, NATPMP_PORT, this.gatewayIp).catch((err) => {
-        if (this.pendingPmp) {
+      socket.send(request, NATPMP_PORT, this.gatewayIp).catch((err) => {
+        if (this.pendingPmp === entry) {
           clearTimeout(this.pendingPmp.timer)
           this.pendingPmp = null
           wrappedResolve(
@@ -363,21 +416,55 @@ export class PmpPcpClient {
     })
   }
 
-  private ensureSocket(): Promise<void> {
+  private ensureSocket(): Promise<UdpSocket> {
     if (this.socketReady) return this.socketReady
-    this.socketReady = this.bindSocket()
+    const socket = this.udpFactory({ type: 'udp4' })
+    this.socket = socket
+    this.socketReady = this.bindSocket(socket)
     return this.socketReady
   }
 
-  private async bindSocket(): Promise<void> {
-    this.socket = this.udpFactory({ type: 'udp4' })
-    await this.socket.bind(0)
-    this.socket.onMessage((msg, rinfo) => this.onMessage(msg, rinfo))
-    this.nonceCleanupTimer = setInterval(
-      () => this.cleanupExpiredNonces(),
-      1000
-    )
-    this.nonceCleanupTimer.unref?.()
+  private async bindSocket(socket: UdpSocket): Promise<UdpSocket> {
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      this.cancelSocketReady = () => reject(new Error('client closing'))
+    })
+    try {
+      await Promise.race([
+        Promise.resolve().then(() => {
+          if (this.socket !== socket) throw new Error('client closing')
+          return socket.bind(0)
+        }),
+        cancelled,
+      ])
+      if (this.socket !== socket) throw new Error('client closing')
+      this.cancelSocketReady = null
+      socket.onMessage((msg, rinfo) => {
+        if (this.socket === socket) this.onMessage(msg, rinfo)
+      })
+      this.nonceCleanupTimer = setInterval(
+        () => this.cleanupExpiredNonces(),
+        1000
+      )
+      this.nonceCleanupTimer.unref?.()
+      return socket
+    } catch (error) {
+      // A failed bind must not poison all future requests with a cached
+      // rejection. A detached socket is already owned by close().
+      if (this.socket === socket) {
+        this.socket = null
+        this.socketReady = null
+        this.cancelSocketReady = null
+        try {
+          await socket.close()
+        } catch (closeError) {
+          log.warn(
+            { err: closeError },
+            'failed to close UDP socket after bind failure'
+          )
+        }
+      }
+      throw error
+    }
   }
 
   private onMessage(msg: Buffer, rinfo: UdpRemoteInfo): void {

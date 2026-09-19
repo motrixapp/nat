@@ -160,4 +160,116 @@ describe('NodeUdpSocket', () => {
     )
     expect(() => subject.setMulticastTTL(1)).toThrow('socket closed')
   })
+
+  it('contains errors after bind and rejects in-flight sends', async () => {
+    const { socket, subject } = createSubject()
+    await subject.bind()
+    socket.send.mockImplementationOnce(() => {})
+    const sent = subject.send(Buffer.from('x'), 5351, '192.168.1.1')
+    const failed = expect(sent).rejects.toThrow('network changed')
+    expect(() =>
+      socket.emit('error', new Error('network changed'))
+    ).not.toThrow()
+    await failed
+    await subject.close()
+  })
+
+  it('settles a pending bind on close even if its callback never arrives', async () => {
+    const { socket, subject } = createSubject()
+    socket.bind.mockImplementationOnce(() => {})
+    const bound = expect(subject.bind()).rejects.toThrow('socket closed')
+    await subject.close()
+    await bound
+  })
+
+  it('shares completion between concurrent closes', async () => {
+    const { socket, subject } = createSubject()
+    let finishClose = () => {}
+    socket.close.mockImplementationOnce((callback) => {
+      finishClose = callback
+    })
+    const first = subject.close()
+    const second = subject.close()
+    expect(first).toBe(second)
+    finishClose()
+    await Promise.all([first, second])
+    expect(socket.close).toHaveBeenCalledOnce()
+  })
+
+  it('tolerates an already-closed native socket', async () => {
+    const { socket, subject } = createSubject()
+    socket.close.mockImplementationOnce(() => {
+      throw Object.assign(new Error('Not running'), {
+        code: 'ERR_SOCKET_DGRAM_NOT_RUNNING',
+      })
+    })
+    await expect(subject.close()).resolves.toBeUndefined()
+    await expect(subject.close()).resolves.toBeUndefined()
+  })
+
+  it('contains late native errors and messages after close', async () => {
+    const { socket, subject } = createSubject()
+    const listener = vi.fn()
+    subject.onMessage(listener)
+    await subject.close()
+    expect(() => socket.emit('error', new Error('late error'))).not.toThrow()
+    socket.emit('message', Buffer.from('late'), {
+      address: '192.168.1.1',
+      port: 5351,
+      size: 4,
+    })
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('allows retry after a synchronous bind failure without keeping stale callbacks', async () => {
+    const { socket, subject } = createSubject()
+    socket.bind.mockImplementationOnce(() => {
+      throw new Error('bind failed')
+    })
+    await expect(subject.bind()).rejects.toThrow('bind failed')
+    await expect(subject.bind()).resolves.toBeUndefined()
+    expect(() => socket.emit('error', new Error('idle error'))).not.toThrow()
+    await expect(
+      subject.send(Buffer.from('x'), 5351, '192.168.1.1')
+    ).resolves.toBeUndefined()
+    await subject.close()
+  })
+
+  it('rejects pending sends on close and ignores their late callbacks', async () => {
+    const { socket, subject } = createSubject()
+    let callback = (_error: Error | null) => {}
+    socket.send.mockImplementationOnce((_msg, _port, _address, cb) => {
+      callback = cb
+    })
+    const sent = expect(
+      subject.send(Buffer.from('x'), 5351, '192.168.1.1')
+    ).rejects.toThrow('socket closed')
+    await subject.close()
+    await sent
+    expect(() => callback(new Error('late error'))).not.toThrow()
+    expect(socket.close).toHaveBeenCalledOnce()
+  })
+
+  it('propagates unexpected native close failures', async () => {
+    const { socket, subject } = createSubject()
+    socket.close.mockImplementationOnce(() => {
+      throw new Error('close failed')
+    })
+    await expect(subject.close()).rejects.toThrow('close failed')
+    await expect(subject.close()).rejects.toThrow('close failed')
+    expect(socket.close).toHaveBeenCalledOnce()
+  })
+
+  it('settles pending work when the native socket closes independently', async () => {
+    const { socket, subject } = createSubject()
+    socket.send.mockImplementationOnce(() => {})
+    const sent = expect(
+      subject.send(Buffer.from('x'), 5351, '192.168.1.1')
+    ).rejects.toThrow('socket closed')
+    socket.emit('close')
+    await sent
+    await subject.close()
+    expect(socket.close).not.toHaveBeenCalled()
+    expect(subject.address()).toBeNull()
+  })
 })

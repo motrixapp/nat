@@ -45,6 +45,7 @@ export class StunClient {
     // classification (Symmetric vs FullCone) requires two-server comparison;
     // that's future work.
     for (const server of options.servers) {
+      if (options.signal?.aborted) break
       const parsed = this.parseServer(server)
       if (!parsed.ok) {
         log.warn({ server }, 'ignoring invalid STUN server format')
@@ -100,7 +101,14 @@ export class StunClient {
       const finish = async (r: ParseResult<StunResult>) => {
         if (settled) return
         settled = true
-        await socket.close().catch(() => {})
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        socket.offMessage(onMessage)
+        try {
+          await socket.close()
+        } catch (error) {
+          log.warn({ err: error }, 'failed to close STUN socket')
+        }
         resolve(r)
       }
 
@@ -110,33 +118,28 @@ export class StunClient {
       )
       timer.unref?.()
 
-      socket.onMessage((msg, _rinfo) => {
+      const onMessage = (msg: Buffer) => {
         if (settled) return
         const parsed = parseBindingResponse(msg, transactionId)
         if (!parsed.ok) return
-        clearTimeout(timer)
         void finish(parsed)
-      })
+      }
+      socket.onMessage(onMessage)
+      const onAbort = () =>
+        void finish(parseErr(NatErrorCode.Timeout, 'aborted'))
 
       if (signal) {
         if (signal.aborted) {
-          clearTimeout(timer)
-          void finish(parseErr(NatErrorCode.Timeout, 'aborted'))
+          onAbort()
           return
         }
-        signal.addEventListener(
-          'abort',
-          () => {
-            clearTimeout(timer)
-            void finish(parseErr(NatErrorCode.Timeout, 'aborted'))
-          },
-          { once: true }
-        )
+        signal.addEventListener('abort', onAbort, { once: true })
       }
 
       ;(async () => {
         try {
           await socket.bind(0)
+          if (settled) return
           await socket.send(buffer, port, host)
         } catch (err) {
           clearTimeout(timer)

@@ -116,13 +116,19 @@ export class UpnpClient {
     const ac = new AbortController()
 
     const cleanup = async () => {
-      await socket.close().catch(() => {})
+      try {
+        await socket.close()
+      } catch (error) {
+        log.warn({ err: error }, 'failed to close discovery socket')
+      }
     }
 
     return new Promise<ParseResult<DiscoveredGateway>>((resolve) => {
       const settle = async (r: ParseResult<DiscoveredGateway>) => {
         if (settled) return
         settled = true
+        clearTimeout(timer)
+        socket.offMessage(listener)
         ac.abort()
         this.discovering = false
         await cleanup()
@@ -213,12 +219,14 @@ export class UpnpClient {
       ;(async () => {
         try {
           await socket.bind(0, interfaceAddress)
+          if (settled) return
           if (interfaceAddress) {
             // Binding fixes the unicast response address; IP_MULTICAST_IF
             // fixes the outgoing M-SEARCH interface (including on Windows).
             socket.setMulticastInterface?.(interfaceAddress)
           }
           for (const st of searchTargets) {
+            if (settled) return
             await socket.send(
               buildMSearch(st, mx),
               SSDP_MULTICAST_PORT,
