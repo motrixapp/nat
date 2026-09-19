@@ -156,6 +156,48 @@ describe('UpnpClient.discover', () => {
     }
   })
 
+  it('discovers Huawei HiLink with its vendor header and PPP service', async () => {
+    http.history
+      .expect({
+        method: 'GET',
+        host: '192.168.3.1',
+        port: 37215,
+        path: '/router/upnpdev.xml',
+      })
+      .reply({
+        statusCode: 200,
+        body: VALID_DEVICE_XML.replaceAll(
+          'WANIPConnection:1',
+          'WANPPPConnection:1'
+        ),
+      })
+    const pending = client.discover({ timeoutMs: 100 })
+    await tick()
+    const response = buildSsdpResponse(
+      'http://192.168.3.1:37215/router/upnpdev.xml'
+    )
+      .toString('ascii')
+      .replace(
+        'SERVER: test',
+        'SERVER: Linux UPnP/1.0 Huawei-ATP-IGD\r\nHILINK_EXT: 0'
+      )
+    udpFactory.sockets[0]!.emitMessage(Buffer.from(response, 'ascii'), {
+      address: '192.168.3.1',
+      port: 1900,
+      size: Buffer.byteLength(response),
+    })
+    expect(await pending).toMatchObject({
+      ok: true,
+      value: {
+        gatewayIp: '192.168.3.1',
+        controlHost: '192.168.3.1',
+        controlPort: 37215,
+        serviceType: 'urn:schemas-upnp-org:service:WANPPPConnection:1',
+      },
+    })
+    expect(http.history.calls).toHaveLength(1)
+  })
+
   it('returns discovered gateway on valid response', async () => {
     http.history
       .expect({

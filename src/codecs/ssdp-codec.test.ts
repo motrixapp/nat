@@ -90,6 +90,96 @@ describe('parseMSearchResponse happy path', () => {
   })
 })
 
+describe('SSDP extension header names', () => {
+  it('accepts the Huawei HiLink discovery response', () => {
+    const result = parseMSearchResponse(
+      buildSsdpResponse({
+        LOCATION: 'http://192.168.3.1:37215/router/upnpdev.xml',
+        SERVER: 'Linux UPnP/1.0 Huawei-ATP-IGD',
+        HILINK_EXT: '0',
+        EXT: '',
+      })
+    )
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        server: 'Linux UPnP/1.0 Huawei-ATP-IGD',
+        endpoint: {
+          host: '192.168.3.1',
+          port: 37215,
+          path: '/router/upnpdev.xml',
+        },
+      },
+    })
+  })
+
+  it.each([
+    '!',
+    '#',
+    '$',
+    '%',
+    '&',
+    "'",
+    '*',
+    '+',
+    '-',
+    '.',
+    '^',
+    '_',
+    '`',
+    '|',
+    '~',
+  ])(
+    'accepts RFC 9110 token punctuation %s in extension headers',
+    (character) => {
+      expect(
+        parseMSearchResponse(buildSsdpResponse({ [`X${character}EXT`]: '0' }))
+          .ok
+      ).toBe(true)
+    }
+  )
+
+  it.each([
+    ' ',
+    '\t',
+    '/',
+    '(',
+    ')',
+    '[',
+    ']',
+    '{',
+    '}',
+    '<',
+    '>',
+    '@',
+    ',',
+    ';',
+    '=',
+    '?',
+    '"',
+    '\\',
+  ])('rejects header-name whitespace or delimiter %j', (character) => {
+    expect(
+      parseMSearchResponse(buildSsdpResponse({ [`X${character}EXT`]: '0' }))
+    ).toMatchObject({
+      ok: false,
+      error: NatErrorCode.ParseError,
+      detail: 'invalid header name',
+    })
+  })
+
+  it('continues rejecting public LOCATION addresses with a valid vendor header', () => {
+    expect(
+      parseMSearchResponse(
+        buildSsdpResponse({
+          HILINK_EXT: '0',
+          LOCATION: 'http://8.8.8.8/upnpdev.xml',
+        })
+      )
+    ).toMatchObject({ ok: false, error: NatErrorCode.SecurityViolation })
+  })
+})
+
 describe('parseMSearchResponse security', () => {
   it('rejects response exceeding max size', () => {
     const huge = Buffer.alloc(5000, 0x20)
@@ -174,9 +264,8 @@ describe('parseMSearchResponse additional branches', () => {
   })
 
   it('rejects header name with invalid characters', () => {
-    const text = 'HTTP/1.1 200 OK\r\nX_INVALID: value\r\n\r\n'
-    const r = parseMSearchResponse(Buffer.from(text, 'ascii'))
-    expect(r.ok).toBe(false)
+    const r = parseMSearchResponse(buildSsdpResponse({ 'X/INVALID': 'value' }))
+    expect(r).toMatchObject({ ok: false, detail: 'invalid header name' })
   })
 
   it('rejects header value exceeding max length', () => {
