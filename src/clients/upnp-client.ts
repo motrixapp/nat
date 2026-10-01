@@ -200,6 +200,11 @@ export class UpnpClient {
             modelName: desc.value.modelName,
           }
           await settle(parseOk(found))
+        } catch (error) {
+          // UDP listeners are not awaited. Keep an unexpected transport
+          // rejection from becoming an unhandled rejection, and try the
+          // next response within the existing discovery budget.
+          log.warn({ err: error }, 'device description fetch failed')
         } finally {
           processingResponse = false
         }

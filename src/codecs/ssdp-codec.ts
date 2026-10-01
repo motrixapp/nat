@@ -172,7 +172,7 @@ export function validateLocationUrl(url: string): ParseResult<{
 
   for (let i = 0; i < path.length; i++) {
     const c = path.charCodeAt(i)
-    if (c < 0x20 || c > 0x7e) {
+    if (c <= 0x20 || c > 0x7e) {
       return parseErr(
         NatErrorCode.SecurityViolation,
         'path contains disallowed byte'

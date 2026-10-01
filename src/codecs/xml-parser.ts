@@ -5,6 +5,7 @@ import {
   tokenizeXml,
   XmlTokenType,
 } from './xml-tokenizer.js'
+import { trimXmlWhitespace } from './xml-whitespace.js'
 
 export interface XmlElement {
   name: string
@@ -81,7 +82,7 @@ export function parseXml(
       }
     } else {
       if (stack.length === 0) {
-        if (token.value.trim().length > 0) {
+        if (/[^ \t\r\n]/.test(token.value)) {
           return parseErr(NatErrorCode.ParseError, 'text outside root element')
         }
         continue
@@ -102,7 +103,8 @@ export function parseXml(
 }
 
 function trimTextRecursively(el: XmlElement): void {
-  el.text = el.text.trim()
+  // Trim XML S only, preserving Unicode characters such as NBSP in data.
+  el.text = trimXmlWhitespace(el.text)
   for (const child of el.children) trimTextRecursively(child)
 }
 

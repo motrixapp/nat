@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
+  NatErrorCode,
   nodeHttpClient,
   nodeUdpSocketFactory,
   PmpPcpClient,
+  parseDeviceDescription,
   parseXml,
   UpnpClient,
 } from '../../src/index.js'
@@ -75,6 +77,48 @@ describe.skipIf(SKIP)('NAT docker matrix', () => {
   })
 
   describe('Hostile router', () => {
+    it('preserves Unicode device metadata over HTTP', async () => {
+      const res = await nodeHttpClient.request({
+        method: 'GET',
+        host: await containerIp('hostile'),
+        port: 49154,
+        path: '/unicode',
+        timeoutMs: 3000,
+      })
+      expect(res.ok).toBe(true)
+      if (res.ok) {
+        expect(parseDeviceDescription(res.value.body)).toEqual({
+          ok: true,
+          value: {
+            friendlyName: '华为路由AX3📡',
+            manufacturer: '华为 技术',
+            modelName: 'WS7100-15',
+            services: [
+              {
+                serviceType: 'urn:schemas-upnp-org:service:WANIPConnection:1',
+                controlUrl: '/ctl/IPConn',
+              },
+            ],
+          },
+        })
+      }
+    })
+
+    it('rejects malformed UTF-8 before it reaches the XML parser', async () => {
+      const res = await nodeHttpClient.request({
+        method: 'GET',
+        host: await containerIp('hostile'),
+        port: 49154,
+        path: '/invalid-utf8',
+        timeoutMs: 3000,
+      })
+      expect(res).toEqual({
+        ok: false,
+        error: NatErrorCode.SecurityViolation,
+        detail: 'invalid UTF-8 response',
+      })
+    })
+
     // nodeHttpClient's SSRF guard admits only private/link-local hosts, so
     // 127.0.0.1:published-port is unreachable by design — always target the
     // container's RFC1918 bridge address.

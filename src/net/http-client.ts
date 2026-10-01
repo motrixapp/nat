@@ -1,3 +1,4 @@
+import { isUtf8 } from 'node:buffer'
 import http from 'node:http'
 import {
   isIpv4String,
@@ -58,58 +59,82 @@ export class NodeHttpClient implements HttpClient {
         resolve(r)
       }
 
-      const req = http.request(
-        {
-          method: input.method,
-          host: input.host,
-          port: input.port,
-          path: input.path,
-          headers: input.headers ?? {},
-          // Prevent any hostname resolution path by omitting 'lookup' and passing only literal IP
-          family: 4,
-        },
-        (res) => {
-          const status = res.statusCode ?? 0
-          // Reject 3xx as protocol error — never follow redirects
-          if (status >= 300 && status < 400) {
-            res.destroy()
-            return settle(
-              parseErr(
-                NatErrorCode.SecurityViolation,
-                `unexpected redirect: ${status}`
-              )
-            )
-          }
-          let bytes = 0
-          const chunks: Buffer[] = []
-          res.on('data', (chunk: Buffer) => {
-            bytes += chunk.length
-            if (bytes > HTTP_MAX_RESPONSE_SIZE) {
+      let req: http.ClientRequest
+      try {
+        req = http.request(
+          {
+            method: input.method,
+            host: input.host,
+            port: input.port,
+            path: input.path,
+            headers: input.headers ?? {},
+            // Prevent any hostname resolution path by omitting 'lookup' and passing only literal IP
+            family: 4,
+          },
+          (res) => {
+            const status = res.statusCode ?? 0
+            // Reject 3xx as protocol error — never follow redirects
+            if (status >= 300 && status < 400) {
               res.destroy()
               return settle(
                 parseErr(
                   NatErrorCode.SecurityViolation,
-                  'http response too large'
+                  `unexpected redirect: ${status}`
                 )
               )
             }
-            chunks.push(chunk)
-          })
-          res.on('end', () => {
-            const body = Buffer.concat(chunks).toString('utf-8')
-            const headers: Record<string, string> = {}
-            for (const [k, v] of Object.entries(res.headers)) {
-              headers[k.toLowerCase()] = Array.isArray(v)
-                ? v.join(',')
-                : (v ?? '')
-            }
-            settle(parseOk({ statusCode: status, headers, body }))
-          })
-          res.on('error', (e) =>
-            settle(parseErr(NatErrorCode.ParseError, e.message))
+            let bytes = 0
+            const chunks: Buffer[] = []
+            res.on('data', (chunk: Buffer) => {
+              bytes += chunk.length
+              if (bytes > HTTP_MAX_RESPONSE_SIZE) {
+                res.destroy()
+                return settle(
+                  parseErr(
+                    NatErrorCode.SecurityViolation,
+                    'http response too large'
+                  )
+                )
+              }
+              chunks.push(chunk)
+            })
+            res.on('end', () => {
+              const rawBody = Buffer.concat(chunks)
+              // Validate before decoding: toString replaces malformed UTF-8
+              // with U+FFFD, hiding invalid sequences from the XML codec.
+              if (!isUtf8(rawBody)) {
+                return settle(
+                  parseErr(
+                    NatErrorCode.SecurityViolation,
+                    'invalid UTF-8 response'
+                  )
+                )
+              }
+              const body = rawBody.toString('utf-8')
+              const headers: Record<string, string> = {}
+              for (const [k, v] of Object.entries(res.headers)) {
+                headers[k.toLowerCase()] = Array.isArray(v)
+                  ? v.join(',')
+                  : (v ?? '')
+              }
+              settle(parseOk({ statusCode: status, headers, body }))
+            })
+            res.on('error', (e) =>
+              settle(parseErr(NatErrorCode.ParseError, e.message))
+            )
+          }
+        )
+      } catch (error) {
+        settle(
+          parseErr(
+            NatErrorCode.ParseError,
+            error instanceof Error
+              ? error.message
+              : 'HTTP request creation failed'
           )
-        }
-      )
+        )
+        return
+      }
 
       req.setTimeout(timeoutMs, () => {
         req.destroy()
