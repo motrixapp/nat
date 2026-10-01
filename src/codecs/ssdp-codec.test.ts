@@ -334,6 +334,21 @@ describe('validateLocationUrl additional branches', () => {
 })
 
 describe('validateLocationUrl direct call', () => {
+  it('rejects unescaped spaces in the request path', () => {
+    expect(validateLocationUrl('http://192.168.1.1/a b')).toEqual({
+      ok: false,
+      error: NatErrorCode.SecurityViolation,
+      detail: 'path contains disallowed byte',
+    })
+  })
+
+  it('preserves percent-encoded spaces in the request path', () => {
+    expect(validateLocationUrl('http://192.168.1.1/a%20b')).toEqual({
+      ok: true,
+      value: { host: '192.168.1.1', port: 80, path: '/a%20b' },
+    })
+  })
+
   it('rejects path containing disallowed byte (direct call bypasses byte scanner)', () => {
     // validateLocationUrl is exported — call it directly with a URL whose path
     // contains a control character that would be blocked by parseMSearchResponse

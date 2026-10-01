@@ -1,5 +1,6 @@
 import { NatErrorCode } from '../errors.js'
 import { type ParseResult, parseErr, parseOk } from './parse-result.js'
+import { trimXmlWhitespace } from './xml-whitespace.js'
 
 export const DEFAULT_XML_MAX_SIZE = 64 * 1024
 export const XML_MAX_TAG_NAME_LENGTH = 64
@@ -43,12 +44,15 @@ const ALLOWED_ENTITIES: Record<string, string> = {
   apos: "'",
 }
 
-function isAllowedByte(code: number): boolean {
+// XML 1.0 Fifth Edition, production [2] (Char).
+function isXmlChar(code: number): boolean {
   return (
-    (code >= 0x20 && code <= 0x7e) ||
     code === 0x09 ||
     code === 0x0a ||
-    code === 0x0d
+    code === 0x0d ||
+    (code >= 0x20 && code <= 0xd7ff) ||
+    (code >= 0xe000 && code <= 0xfffd) ||
+    (code >= 0x10000 && code <= 0x10ffff)
   )
 }
 
@@ -66,18 +70,31 @@ export function tokenizeXml(
 ): ParseResult<XmlToken[]> {
   const maxSize = options.maxSize ?? DEFAULT_XML_MAX_SIZE
 
-  if (xml.length > maxSize) {
+  // Keep the original byte budget now that one character may span many bytes.
+  if (xml.length > maxSize || Buffer.byteLength(xml, 'utf-8') > maxSize) {
     return parseErr(NatErrorCode.SecurityViolation, 'xml exceeds max size')
   }
 
   for (let i = 0; i < xml.length; i++) {
-    const code = xml.charCodeAt(i)
-    if (code > 0x7e) {
-      return parseErr(NatErrorCode.SecurityViolation, 'non-ASCII byte')
+    // codePointAt combines valid UTF-16 pairs, but leaves lone surrogates
+    // in 0xD800..0xDFFF, which the XML Char ranges exclude.
+    const code = xml.codePointAt(i) ?? 0
+    if (!isXmlChar(code)) {
+      return parseErr(
+        NatErrorCode.SecurityViolation,
+        code < 0x20
+          ? 'disallowed control char'
+          : code >= 0xd800 && code <= 0xdfff
+            ? 'unpaired surrogate'
+            : 'invalid XML character'
+      )
     }
-    if (!isAllowedByte(code)) {
+    // Preserve the existing ban on DEL/C1 controls, even though XML 1.0
+    // permits them. Unicode support applies to text and attribute values.
+    if (code >= 0x7f && code <= 0x9f) {
       return parseErr(NatErrorCode.SecurityViolation, 'disallowed control char')
     }
+    if (code > 0xffff) i++
   }
 
   const tokens: XmlToken[] = []
@@ -89,7 +106,7 @@ export function tokenizeXml(
       return parseErr(NatErrorCode.ParseError, 'unterminated XML declaration')
     }
     i = end + 2
-    while (i < xml.length && /\s/.test(xml[i] ?? '')) i++
+    while (i < xml.length && /[ \t\r\n]/.test(xml[i] ?? '')) i++
   }
 
   while (i < xml.length) {
@@ -123,7 +140,7 @@ export function tokenizeXml(
         if (close < 0) {
           return parseErr(NatErrorCode.ParseError, 'unterminated end tag')
         }
-        const name = xml.slice(i + 2, close).trim()
+        const name = trimXmlWhitespace(xml.slice(i + 2, close))
         if (!validateName(name)) {
           return parseErr(NatErrorCode.SecurityViolation, 'invalid tag name')
         }
@@ -176,7 +193,9 @@ function validateName(name: string): boolean {
 function parseStartTag(
   body: string
 ): ParseResult<Omit<XmlStartTag, 'selfClosing'>> {
-  const trimmed = body.trim()
+  // XML S is only space, tab, CR and LF; JS \s/trim also accept Unicode
+  // characters that must not become tag or attribute separators.
+  const trimmed = trimXmlWhitespace(body)
   let p = 0
   const nameMatch = /^([A-Za-z_][A-Za-z0-9_:\-.]*)/.exec(trimmed.slice(p))
   if (!nameMatch) return parseErr(NatErrorCode.ParseError, 'missing tag name')
@@ -188,7 +207,7 @@ function parseStartTag(
 
   const attrs: Array<{ name: string; value: string }> = []
   while (p < trimmed.length) {
-    while (p < trimmed.length && /\s/.test(trimmed[p] ?? '')) p++
+    while (p < trimmed.length && /[ \t\r\n]/.test(trimmed[p] ?? '')) p++
     if (p >= trimmed.length) break
 
     const attrNameMatch = /^([A-Za-z_][A-Za-z0-9_:\-.]*)/.exec(trimmed.slice(p))
@@ -201,7 +220,7 @@ function parseStartTag(
     }
     p += attrName.length
 
-    while (p < trimmed.length && /\s/.test(trimmed[p] ?? '')) p++
+    while (p < trimmed.length && /[ \t\r\n]/.test(trimmed[p] ?? '')) p++
     if (trimmed[p] !== '=') {
       return parseErr(
         NatErrorCode.ParseError,
@@ -209,7 +228,7 @@ function parseStartTag(
       )
     }
     p++
-    while (p < trimmed.length && /\s/.test(trimmed[p] ?? '')) p++
+    while (p < trimmed.length && /[ \t\r\n]/.test(trimmed[p] ?? '')) p++
     if (trimmed[p] !== '"') {
       return parseErr(
         NatErrorCode.SecurityViolation,

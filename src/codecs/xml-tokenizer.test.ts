@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { NatErrorCode } from '../errors.js'
 import { tokenizeXml, XmlTokenType } from './xml-tokenizer.js'
 
-describe('xml-tokenizer byte-level safety', () => {
+describe('xml-tokenizer character safety', () => {
   it('rejects input exceeding max size', () => {
     const xml = `<a>${'x'.repeat(64 * 1024)}</a>`
     const r = tokenizeXml(xml, { maxSize: 1024 })
@@ -11,16 +11,159 @@ describe('xml-tokenizer byte-level safety', () => {
     if (!r.ok) expect(r.error).toBe(NatErrorCode.SecurityViolation)
   })
 
-  it('rejects non-ASCII bytes', () => {
-    const xml = '<a>\u00e9</a>'
-    const r = tokenizeXml(xml)
-    expect(r.ok).toBe(false)
+  it('enforces the UTF-8 byte budget for Unicode input', () => {
+    const xml = '<a>华为📡</a>'
+    const byteLength = Buffer.byteLength(xml, 'utf-8')
+    expect(byteLength).toBeGreaterThan(xml.length)
+    expect(tokenizeXml(xml, { maxSize: byteLength }).ok).toBe(true)
+    expect(tokenizeXml(xml, { maxSize: byteLength - 1 })).toEqual({
+      ok: false,
+      error: NatErrorCode.SecurityViolation,
+      detail: 'xml exceeds max size',
+    })
   })
 
-  it('rejects control characters (except \\t \\n \\r)', () => {
-    const xml = '<a>\u0001</a>'
+  it.each([
+    '华为路由AX3',
+    'Café e\u0301 日本語 العربية',
+    ...[
+      0x20, 0x7e, 0xa0, 0xd7ff, 0xe000, 0xfdd0, 0xfffd, 0x10000, 0x1f4e1,
+      0x1fffe, 0x20000, 0x10ffff,
+    ].map((code) => String.fromCodePoint(code)),
+  ])('preserves valid Unicode %j in text and attribute values', (value) => {
+    const r = tokenizeXml(`<a name="${value}">${value}</a>`)
+    expect(r).toEqual({
+      ok: true,
+      value: [
+        {
+          type: XmlTokenType.StartTag,
+          name: 'a',
+          attrs: [{ name: 'name', value }],
+          selfClosing: false,
+        },
+        { type: XmlTokenType.Text, value },
+        { type: XmlTokenType.EndTag, name: 'a' },
+      ],
+    })
+  })
+
+  it.each([
+    ...Array.from({ length: 0x20 }, (_, code) => code).filter(
+      (code) => code !== 0x09 && code !== 0x0a && code !== 0x0d
+    ),
+    ...Array.from({ length: 0x21 }, (_, offset) => 0x7f + offset),
+  ])('rejects control code point %i in text and attributes', (code) => {
+    const value = String.fromCharCode(code)
+    for (const xml of [`<a>${value}</a>`, `<a name="${value}"/>`]) {
+      expect(tokenizeXml(xml)).toEqual({
+        ok: false,
+        error: NatErrorCode.SecurityViolation,
+        detail: 'disallowed control char',
+      })
+    }
+  })
+
+  it.each([0xfffe, 0xffff])('rejects invalid XML code point %i', (code) => {
+    const value = String.fromCharCode(code)
+    for (const xml of [`<a>${value}</a>`, `<a name="${value}"/>`]) {
+      expect(tokenizeXml(xml)).toEqual({
+        ok: false,
+        error: NatErrorCode.SecurityViolation,
+        detail: 'invalid XML character',
+      })
+    }
+  })
+
+  it.each([
+    '\ud800',
+    '\udbff',
+    '\udc00',
+    '\udfff',
+    '\ud800x',
+    '\ud800\ud800',
+    '\udc00\ud800',
+    '\udc00\udc00',
+    '\ud800\udc00\udc00',
+  ])('rejects unpaired or malformed surrogates %j', (value) => {
+    // Include end-of-input so a high surrogate cannot read past the string.
+    for (const xml of [
+      `<a>${value}</a>`,
+      `<a name="${value}"/>`,
+      `<a/>${value}`,
+    ]) {
+      expect(tokenizeXml(xml)).toEqual({
+        ok: false,
+        error: NatErrorCode.SecurityViolation,
+        detail: 'unpaired surrogate',
+      })
+    }
+  })
+
+  it.each([
+    '<华为/>',
+    '<a华为/>',
+    '<a></华为>',
+    '<a></a华为>',
+    '<a 名称="value"/>',
+    '<a name华为="value"/>',
+    '<a\u0301/>',
+    '<a \u{10000}="value"/>',
+  ])('keeps element and attribute names ASCII-only: %s', (xml) => {
+    expect(tokenizeXml(xml).ok).toBe(false)
+  })
+
+  it.each([
+    '\u00a0',
+    '\u1680',
+    '\u2003',
+    '\u2028',
+    '\u2029',
+    '\u202f',
+    '\u3000',
+    '\ufeff',
+  ])('rejects non-XML whitespace %j in markup', (space) => {
+    for (const xml of [
+      `<${space}a/>`,
+      `<a${space}/>`,
+      `<a${space}name="x"/>`,
+      `<a name${space}="x"/>`,
+      `<a name=${space}"x"/>`,
+      `<a></a${space}>`,
+      `<a></${space}a>`,
+    ]) {
+      expect(tokenizeXml(xml).ok).toBe(false)
+    }
+  })
+
+  it.each([
+    '<!DOCTYPE a><a>华为</a>',
+    '<!ENTITY x "华为"><a/>',
+    '<a><![CDATA[华为]]></a>',
+    '<a><!--华为--></a>',
+    '<?vendor 华为?><a/>',
+    '<a>华为&#21326;</a>',
+    '<a>华为&#x534E;</a>',
+    '<a name="华为&#x1F4E1;"/>',
+  ])('keeps unsafe constructs forbidden with Unicode: %s', (xml) => {
     const r = tokenizeXml(xml)
     expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toBe(NatErrorCode.SecurityViolation)
+  })
+
+  it('decodes only standard entities alongside Unicode', () => {
+    const r = tokenizeXml(
+      '<a name="华为&amp;📡">华为&lt;&gt;&amp;&quot;&apos;📡</a>'
+    )
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.value[0]).toMatchObject({
+        attrs: [{ name: 'name', value: '华为&📡' }],
+      })
+      expect(r.value[1]).toEqual({
+        type: XmlTokenType.Text,
+        value: `华为<>&"'📡`,
+      })
+    }
   })
 
   it('accepts \\t \\n \\r', () => {

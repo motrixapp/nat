@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { tick } from '../__test__/utils.js'
 import {
   SSDP_IGD_V1_ST,
@@ -224,6 +224,46 @@ describe('UpnpClient.discover', () => {
     }
   })
 
+  it('discovers a gateway with Huawei AX3 Unicode metadata (issue #5)', async () => {
+    const body = VALID_DEVICE_XML.replace(
+      '<manufacturer>TestCorp</manufacturer>',
+      '<friendlyName>华为路由AX3</friendlyName><manufacturer>华为 技术</manufacturer>'
+    ).replace(
+      '<modelName>Test</modelName>',
+      '<modelName>WS7100-15📡</modelName>'
+    )
+    http.history
+      .expect({
+        method: 'GET',
+        host: '192.168.3.1',
+        port: 37215,
+        path: '/upnpdev.xml',
+      })
+      .reply({ statusCode: 200, body })
+
+    const pending = client.discover({ timeoutMs: 2000 })
+    await tick()
+    udpFactory.sockets[0]!.emitMessage(
+      buildSsdpResponse('http://192.168.3.1:37215/upnpdev.xml'),
+      { address: '192.168.3.1', port: 1900, size: 0 }
+    )
+
+    expect(await pending).toEqual({
+      ok: true,
+      value: {
+        gatewayIp: '192.168.3.1',
+        controlHost: '192.168.3.1',
+        controlPort: 37215,
+        controlUrl: '/ctl/IPConn',
+        serviceType: 'urn:schemas-upnp-org:service:WANIPConnection:1',
+        manufacturer: '华为 技术',
+        modelName: 'WS7100-15📡',
+      },
+    })
+    expect(http.history.calls).toHaveLength(1)
+    expect(udpFactory.sockets[0]!.closed).toBe(true)
+  })
+
   it('stops accepting responses after first valid gateway', async () => {
     http.history
       .expect({
@@ -309,6 +349,53 @@ describe('UpnpClient.discover', () => {
     expect(r.ok).toBe(false)
     expect(http.history.calls).toHaveLength(0)
   })
+
+  it('ignores an unescaped space in LOCATION and discovers the next gateway', async () => {
+    http.history
+      .expect({ method: 'GET', host: '192.168.1.1', port: 80, path: '/desc' })
+      .reply({ statusCode: 200, body: VALID_DEVICE_XML })
+    const pending = client.discover({ timeoutMs: 1000 })
+    await tick()
+    const socket = udpFactory.sockets[0]!
+    const remote = { address: '192.168.1.1', port: 1900, size: 0 }
+    socket.emitMessage(buildSsdpResponse('http://192.168.1.1/a b'), remote)
+    await tick()
+    socket.emitMessage(buildSsdpResponse('http://192.168.1.1/desc'), remote)
+
+    expect((await pending).ok).toBe(true)
+    expect(http.history.calls).toHaveLength(1)
+    expect(http.history.calls[0]?.path).toBe('/desc')
+    expect(socket.closed).toBe(true)
+  })
+
+  it.each(['throw', 'reject'] as const)(
+    'continues discovery after an HTTP transport %s',
+    async (failure) => {
+      const request = vi.spyOn(http.client, 'request')
+      const error = new Error('HTTP request setup failed')
+      if (failure === 'throw') {
+        request.mockImplementationOnce(() => {
+          throw error
+        })
+      } else {
+        request.mockRejectedValueOnce(error)
+      }
+      http.history
+        .expect({ method: 'GET', host: '192.168.1.1', port: 80, path: '/desc' })
+        .reply({ statusCode: 200, body: VALID_DEVICE_XML })
+      const pending = client.discover({ timeoutMs: 1000 })
+      await tick()
+      const socket = udpFactory.sockets[0]!
+      const remote = { address: '192.168.1.1', port: 1900, size: 0 }
+      socket.emitMessage(buildSsdpResponse('http://192.168.1.1/failed'), remote)
+      await tick()
+      socket.emitMessage(buildSsdpResponse('http://192.168.1.1/desc'), remote)
+
+      expect((await pending).ok).toBe(true)
+      expect(request).toHaveBeenCalledTimes(2)
+      expect(socket.closed).toBe(true)
+    }
+  )
 
   it('times out when no valid response received', async () => {
     const r = await client.discover({ timeoutMs: 50 })

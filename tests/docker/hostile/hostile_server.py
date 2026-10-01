@@ -15,6 +15,19 @@ BILLION_LAUGHS = b"""<?xml version="1.0"?>
 ]>
 <root>&lol3;</root>"""
 
+UNICODE_DEVICE = """<?xml version="1.0" encoding="UTF-8"?>
+<root><device>
+<friendlyName>华为路由AX3📡</friendlyName>
+<manufacturer>华为 技术</manufacturer><modelName>WS7100-15</modelName>
+<serviceList><service>
+<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+<controlURL>/ctl/IPConn</controlURL>
+</service></serviceList></device></root>""".encode("utf-8")
+
+# UTF-8 must never encode surrogate code points. Decoding with replacement
+# would hide this error from the XML character validator.
+INVALID_UTF8_DEVICE = UNICODE_DEVICE.replace("📡".encode("utf-8"), b"\xed\xa0\x80")
+
 REDIRECT_TO_EXTERNAL = None   # signals 302 handler
 
 class HostileHandler(BaseHTTPRequestHandler):
@@ -24,6 +37,10 @@ class HostileHandler(BaseHTTPRequestHandler):
             body = XXE_PAYLOAD
         elif self.path.endswith("/bomb"):
             body = BILLION_LAUGHS
+        elif self.path.endswith("/unicode"):
+            body = UNICODE_DEVICE
+        elif self.path.endswith("/invalid-utf8"):
+            body = INVALID_UTF8_DEVICE
         elif self.path.endswith("/huge"):
             body = b"x" * (200 * 1024)   # 200KB, exceeds SOAP + device-desc caps
         elif self.path.endswith("/redirect"):

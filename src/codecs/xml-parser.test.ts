@@ -19,6 +19,16 @@ describe('parseXml happy path', () => {
     if (r.ok) expect(r.value.text).toBe('hello')
   })
 
+  it('trims XML whitespace while preserving Unicode text and attributes', () => {
+    const text = '\u00a0华为📡\u3000'
+    const r = parseXml(`<root name="${text}"> \t\r\n${text} \t\r\n</root>`)
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.value.text).toBe(text)
+      expect(r.value.attrs.name).toBe(text)
+    }
+  })
+
   it('parses attributes', () => {
     const r = parseXml('<root a="1" b="two"/>')
     expect(r.ok).toBe(true)
@@ -89,6 +99,23 @@ describe('parseXml limits', () => {
 })
 
 describe('parseXml security', () => {
+  it.each(['\u00a0', '\u2003', '\u2028', '\u3000'])(
+    'rejects non-XML whitespace %j outside the root',
+    (space) => {
+      for (const xml of [
+        `${space}<root/>`,
+        `<root/>${space}`,
+        `<?xml version="1.0"?>${space}<root/>`,
+      ]) {
+        expect(parseXml(xml)).toEqual({
+          ok: false,
+          error: NatErrorCode.ParseError,
+          detail: 'text outside root element',
+        })
+      }
+    }
+  )
+
   it('rejects XXE', () => {
     const xxe =
       '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>'
